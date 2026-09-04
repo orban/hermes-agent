@@ -87,7 +87,11 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
 
 def _notification_event_requires_owner(evt: dict) -> bool:
     """Whether ``evt`` must be positively claimed before TUI delivery."""
-    return evt.get("type") == "async_delegation" or bool(evt.get("origin_ui_session_id") or evt.get("session_key"))
+    return evt.get("type") in _DURABLE_EVENT_TYPES or bool(evt.get("origin_ui_session_id") or evt.get("session_key"))
+
+
+# Durable completion-rail events: claimed through a ledger before any UI emission.
+_DURABLE_EVENT_TYPES = frozenset({"async_delegation", "background_event"})
 
 
 # Extra dedup fields per event type. Completions are terminal (one-shot per process session); watch events are not —
@@ -102,8 +106,8 @@ _DEDUP_EXTRA_FIELDS = {
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """UI-emission identity for a process notification event."""
     evt_type = evt.get("type", "completion")
-    if evt_type == "async_delegation":
-        # No process session_id: else every completion keys as ("", "async_delegation") and the second is suppressed forever.
+    if evt_type in _DURABLE_EVENT_TYPES:
+        # No process session_id: else every event keys as ("", evt_type) and the second is suppressed forever.
         return (evt.get("delegation_id", ""), evt_type)
     extra = _DEDUP_EXTRA_FIELDS.get("watch_overflow_" if evt_type.startswith("watch_overflow_") else evt_type, ())
     return (evt.get("session_id", ""), evt_type, *(evt.get(f, 0 if f == "suppressed" else "") for f in extra))
@@ -340,11 +344,9 @@ def _notif_poll_kanban(sid: str, session: dict) -> None:
         _notif_submit(f"__notif__{int(time.time() * 1000)}", sid, session, "\n".join(batch), "kanban notification dispatch failed")
 
 
-def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str) -> None:
-    """Run the claimed (running=True) agent turn for one notification event."""
-    from tools.async_delegation import claim_event_delivery, complete_event_delivery, release_event_delivery
-    if (claim := claim_event_delivery(evt, "tui-poller")) is None:
-        return
+def _notif_dispatch_event(sid: str, session: dict, evt: dict, text: str, claim: str) -> None:
+    """Run the claimed (running=True) agent turn for one notification event holding durable ``claim``."""
+    from tools.async_delegation import complete_event_delivery, release_event_delivery
     kwargs = ({"display_kind": "async_delegation_complete", "display_metadata": _async_delegation_display_metadata(evt)}
               if evt.get("type") == "async_delegation" else {})
     try:
@@ -361,7 +363,7 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> 
     deferred for a resume; ours (or ownerless legacy, kept process-global) → status.update once, then an agent turn if
     idle. False = the drain must stop (session busy)."""
     queue = registry.completion_queue
-    evt_type, is_delegation = evt.get("type", "completion"), evt.get("type") == "async_delegation"
+    evt_type, is_delegation = evt.get("type", "completion"), evt.get("type") in _DURABLE_EVENT_TYPES
     if _notification_event_belongs_elsewhere(sid, session, evt):
         if deferred is not None:
             deferred.append(evt)
@@ -385,6 +387,11 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> 
     text = fmt(evt)
     if not text:
         return True
+    # Claim durable ownership BEFORE emitting anything: untrusted queue content must validate against its ledger
+    # record first, so a forged event can neither surface a status line nor occupy the session slot.
+    from tools.async_delegation import claim_event_delivery, release_event_delivery
+    if (claim := claim_event_delivery(evt, "tui-poller")) is None:
+        return True
     # Emit once per dedup key: a re-queued completion would otherwise re-emit every 0.5s while the session is busy,
     # while distinct watch_match events from one process must stay visible.
     dedup_key = _notification_event_dedup_key(evt)
@@ -392,12 +399,13 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred) -> 
         _emit("status.update", sid, {"kind": "process", "text": text})
         emitted.add(dedup_key)
     if not _notif_claim_turn(session):
+        release_event_delivery(evt, claim)
         queue.put(evt)
         if deferred is not None:
             return False
         time.sleep(0.25)  # back off: the re-queued event keeps the queue non-empty, else this loop spins at 100% CPU
         return True
-    _notif_dispatch_event(sid, session, evt, text)
+    _notif_dispatch_event(sid, session, evt, text, claim)
     return True
 
 

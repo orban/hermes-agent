@@ -31,9 +31,10 @@ _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
-    "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
-    "release": ("release_completion_delivery", "Could not release durable completion claim"),
+    "drop": ("drop_event_delivery", "Could not drop durable completion claim"),
+    "release": ("release_event_delivery", "Could not release durable completion claim"),
 }
+_DURABLE_EVENT_TYPES = frozenset({"async_delegation", "background_event"})
 
 
 class GatewayNotificationsMixin:
@@ -948,7 +949,7 @@ class GatewayNotificationsMixin:
         ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
         """
         evt_type = str(evt.get("type") or "")
-        if evt_type == "async_delegation":
+        if evt_type in _DURABLE_EVENT_TYPES:
             producer_id = str(evt.get("delegation_id") or "")
             return (evt_type, producer_id, "") if producer_id else None
         if evt_type == "completion":
@@ -1017,12 +1018,12 @@ class GatewayNotificationsMixin:
         return "deliver"
 
     @staticmethod
-    def _settle_durable_claim(kind: str, delegation_id: str, claim_id: str) -> None:
-        """Best-effort ``drop``/``release`` of a durable completion claim."""
+    def _settle_durable_claim(kind: str, evt: dict, claim_id: str) -> None:
+        """Best-effort ``drop``/``release`` of a durable claim through the event's own ledger."""
         fn_name, fail_msg = _DURABLE_CLAIM_OPS[kind]
         try:
             import tools.async_delegation as _ad
-            getattr(_ad, fn_name)(delegation_id, claim_id)
+            getattr(_ad, fn_name)(evt, claim_id)
         except Exception:
             logger.debug(fail_msg, exc_info=True)
 
@@ -1035,15 +1036,20 @@ class GatewayNotificationsMixin:
         """
         claim = self._CompletionClaim()
         evt_type = evt.get("type")
-        if evt_type == "async_delegation":
+        if evt_type in _DURABLE_EVENT_TYPES:
             claim.delegation_id = str(evt.get("delegation_id") or "")
             if claim.delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
-                    claim.claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(claim.delegation_id, claim.claim_id):
+                    from tools.async_delegation import claim_event_delivery
+                    claim_id = claim_event_delivery(evt, f"gateway:{id(self)}")
+                    if claim_id is None:
                         claim.proceed = False
                         return claim
+                    claim.claim_id = claim_id or ""
+                    if evt_type == "background_event":
+                        # Plugin-event claim validation compares the queued body with its durable
+                        # ledger record. Add deterministic gateway routing only after that trust boundary.
+                        self._enrich_async_delegation_routing(evt)
                 except Exception as exc:
                     logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
                     claim.proceed, claim.early_result = False, False
@@ -1061,14 +1067,14 @@ class GatewayNotificationsMixin:
         # drops an honest durable disposition.
         verdict = await self._classify_completion_target(parent_session_id)
         if verdict == "terminal":
-            if evt_type == "async_delegation":
+            if evt_type in _DURABLE_EVENT_TYPES:
                 logger.warning(
                     "Async delegation %s targets permanently-gone session %s; "
                     "terminally dropping delivery (result remains in the delegation records).",
                     claim.delegation_id or "<legacy>", parent_session_id,
                 )
                 if claim.claim_id:
-                    self._settle_durable_claim("drop", claim.delegation_id, claim.claim_id)
+                    self._settle_durable_claim("drop", evt, claim.claim_id)
             else:
                 logger.warning(
                     "Background process %s completion targets "
@@ -1080,7 +1086,7 @@ class GatewayNotificationsMixin:
         elif verdict == "retry":
             # Transient uncertainty: tell the watcher to re-poll rather than drop or misroute.
             if claim.claim_id:
-                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
+                self._settle_durable_claim("release", evt, claim.claim_id)
             claim.proceed, claim.early_result = False, False
         return claim
 
@@ -1108,8 +1114,8 @@ class GatewayNotificationsMixin:
             # The durable row is the authoritative replay state — ack it after adapter acceptance.
             if claim.claim_id:
                 try:
-                    from tools.async_delegation import complete_completion_delivery
-                    complete_completion_delivery(claim.delegation_id, claim.claim_id)
+                    from tools.async_delegation import complete_event_delivery
+                    complete_event_delivery(evt, claim.claim_id)
                 except Exception as exc:
                     logger.warning("Could not acknowledge durable async completion %s: %s", claim.delegation_id, exc)
             return True
@@ -1118,7 +1124,7 @@ class GatewayNotificationsMixin:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
             if claim.claim_id and not accepted:
-                self._settle_durable_claim("release", claim.delegation_id, claim.claim_id)
+                self._settle_durable_claim("release", evt, claim.claim_id)
 
     @staticmethod
     def _event_route_key(evt: dict, fields: tuple[str, ...]) -> tuple[str, ...]:
@@ -1348,14 +1354,32 @@ class GatewayNotificationsMixin:
                 # Take async-delegation events only; requeue watch/completion events for their own drains.
                 requeue = []
                 async_events = []
+                background_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    (async_events if evt.get("type") == "async_delegation" else requeue).append(evt)
+                    evt_type = evt.get("type")
+                    bucket = (async_events if evt_type == "async_delegation"
+                              else background_events if evt_type == "background_event" else requeue)
+                    bucket.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
+                # Plugin events are control-plane transitions, not fan-out subagent summaries. Deliver
+                # each independently so permission and input requests are never hidden inside a
+                # coalesced batch.
+                for evt in background_events:
+                    try:
+                        from gateway.run import _format_gateway_process_notification
+                        synth_text = _format_gateway_process_notification(evt)
+                        delivered = (await self._deliver_completion_notification(synth_text, evt)
+                                     if synth_text else None)
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                    except Exception as e:
+                        _pr.completion_queue.put(evt)
+                        logger.error("Background event injection error: %s", e)
                 # A fan-out finishing together yields N completions for one session; group by full route +
                 # parent session so each group becomes ONE consolidated turn.
                 # A same-tick drain often carries several completions for the SAME originating session (a

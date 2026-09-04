@@ -884,3 +884,67 @@ def test_sibling_claimed_by_other_consumer_is_not_double_delivered(
     assert "Result for deleg_owned_1" not in delivered.text
     row = async_delegation.get_durable_delegation(events[1]["delegation_id"])
     assert row["delivery_state"] == "pending"
+
+
+def _background_event(event_id="event-1"):
+    return {
+        "type": "background_event",
+        "delegation_id": f"plugin:claude-sessions:{event_id}",
+        "event_id": event_id,
+        "producer": "claude-sessions",
+        "producer_id": "a1b2c3d4",
+        "kind": "completed",
+        "message": "Managed Claude session completed; inspect and verify it.",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "status": "completed",
+        "dispatched_at": 1000.0,
+        "completed_at": 1012.0,
+    }
+
+
+def test_background_event_watcher_injects_a_fresh_turn_once(
+    monkeypatch, isolated_registry,
+):
+    from tools import background_events
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    background_events.publish_background_event(
+        plugin_id="claude-sessions",
+        event_id="event-1",
+        kind="completed",
+        message="Managed Claude session completed; inspect and verify it.",
+        route={"session_key": "agent:main:telegram:dm:12345:678"},
+        producer_id="a1b2c3d4",
+    )
+    event = isolated.get_nowait()
+    isolated.put(dict(event))
+    isolated.put(dict(event))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    assert delivered.internal is True
+    assert "claude-sessions" in delivered.text
+    assert "inspect and verify" in delivered.text
+
+
+def test_background_event_has_stable_gateway_identity_and_formatter():
+    from gateway.run import _format_gateway_process_notification
+
+    event = _background_event("event-stable")
+
+    assert GatewayRunner._completion_delivery_identity(event) == (
+        "background_event",
+        "plugin:claude-sessions:event-stable",
+        "",
+    )
+    text = _format_gateway_process_notification(event)
+    assert text is not None
+    assert "claude-sessions" in text
+    assert "completed" in text

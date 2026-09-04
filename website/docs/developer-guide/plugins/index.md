@@ -528,7 +528,43 @@ def register(ctx):
 - `ctx.register_command()` registers an in-session slash command (e.g. `/myplugin <args>` inside CLI / gateway chat) — see [Register slash commands](#register-slash-commands) below
 - `ctx.dispatch_tool(name, arguments)` — call any other tool (built-in or from another plugin) with the parent agent's context (approvals, credentials, task_id) wired up automatically. Useful from slash-command handlers that need to invoke `terminal`, `read_file`, or any other tool as if the model had called it directly.
 - `ctx.get_config()` / `ctx.set_config()` access only this plugin's settings namespace; `ctx.state` stores plugin-owned runtime data under the active profile.
+- `ctx.capture_background_event_route(parent_session_id=...)` snapshots the current turn's trusted return route. Persist that mapping with work that will outlive the turn.
+- `ctx.publish_background_event(...)` durably publishes one idempotent semantic event back to that route. The gateway or CLI injects it as a fresh internal turn; never use this API for raw output chunks.
 - If this function crashes, the plugin is disabled but Hermes continues fine
+
+### Publishing asynchronous plugin events
+
+Use the background-event API when a plugin-owned worker or external hook must
+resume the originating conversation after the current turn has ended:
+
+```python
+route = ctx.capture_background_event_route(parent_session_id=session_id)
+
+# Persist `route` beside the external work. Later, from a supervised worker:
+result = ctx.publish_background_event(
+    event_id="build-4f39-complete",  # stable and idempotent
+    kind="completed",
+    message="The delegated build completed; inspect and verify its artifacts.",
+    route=route,
+    producer_id="build-4f39",
+    payload={"artifact": "dist/app.tar"},
+)
+```
+
+The host namespaces `event_id` by plugin, persists the event before queueing it,
+and uses the existing durable completion rail for claims, restart replay,
+session-boundary checks, and delivery acknowledgement. Re-publishing the same
+ID is safe. Capture the route during the originating tool call; a background
+thread has no reliable current-turn context.
+
+Publish **semantic transitions** such as `permission_required`, `needs_input`,
+`failed`, or `completed`. Keep high-volume progress and raw logs in plugin-owned
+storage, then reference them from the wake message. An event wakes a full agent
+turn, so treating every output delta as an event creates an interrupt storm.
+
+Both methods are additive APIs. Plugins that support older Hermes versions
+should probe them with `getattr(ctx, "publish_background_event", None)` and
+retain a bounded reconciliation fallback when unavailable.
 
 **`dispatch_tool` example — a slash command that runs a tool:**
 

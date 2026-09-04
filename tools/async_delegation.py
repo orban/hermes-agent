@@ -159,6 +159,22 @@ def _capture_routing_origin() -> Dict[str, Any]:
         return {}
 
 
+def capture_background_event_route(*, parent_session_id: str = "") -> Dict[str, str]:
+    """Compatibility wrapper for the plugin background-event API."""
+    from tools.background_events import capture_background_event_route as capture_route
+    return capture_route(parent_session_id=parent_session_id)
+
+
+def publish_background_event(
+    *, plugin_id: str, event_id: str, kind: str, message: str, route: Dict[str, Any],
+    producer_id: str = "", payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Compatibility wrapper for the plugin background-event API."""
+    from tools.background_events import publish_background_event as publish_event
+    return publish_event(plugin_id=plugin_id, event_id=event_id, kind=kind, message=message,
+                         route=route, producer_id=producer_id, payload=payload)
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -324,7 +340,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events need no token."""
+    """Claim a durable event through its type-specific ledger; non-durable events need no token."""
+    if evt.get("type") == "background_event":
+        from tools.background_events import claim_event_delivery as claim_background_event
+        return claim_background_event(evt, consumer)
     delegation_id = str(evt.get("delegation_id") or "") if evt.get("type") == "async_delegation" else ""
     if not delegation_id:
         return ""
@@ -385,8 +404,19 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     _event_delivery(release_completion_delivery, evt, claim_id)
 
 
+def drop_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    _event_delivery(drop_completion_delivery, evt, claim_id)
+
+
 def _event_delivery(fn, evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
+    if not claim_id:
+        return
+    if evt.get("type") == "background_event":
+        # Plugin events live in their own ledger; dispatch by the same operation name.
+        import tools.background_events as _be
+        getattr(_be, fn.__name__.replace("completion", "event"))(evt, claim_id)
+        return
+    if evt.get("type") == "async_delegation":
         fn(str(evt.get("delegation_id") or ""), claim_id)
 
 

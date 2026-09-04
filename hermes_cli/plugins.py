@@ -420,6 +420,30 @@ class PluginContext:
         logger.debug("Plugin %s spawned supervised task: %s", self.manifest.name, task_name)
         return task
 
+    # -- durable background events -------------------------------------------
+
+    def capture_background_event_route(self, *, parent_session_id: str = "") -> Dict[str, str]:
+        """Capture the current turn's serializable return address.
+
+        Plugins should persist this mapping when they launch work that may outlive the turn, then
+        pass it unchanged to :meth:`publish_background_event`. The host remains responsible for
+        route validation, session-boundary handling, and wake delivery."""
+        from tools.async_delegation import capture_background_event_route
+        return capture_background_event_route(parent_session_id=parent_session_id)
+
+    def publish_background_event(
+        self, *, event_id: str, kind: str, message: str, route: Dict[str, Any],
+        producer_id: str = "", payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Durably publish one idempotent event back to its originating turn (this manager's profile ledger)."""
+        from tools.async_delegation import publish_background_event
+        with _plugin_home_scope(self._manager.home_path):
+            return publish_background_event(
+                plugin_id=self.plugin_id, event_id=event_id, kind=kind, message=message,
+                route=route, producer_id=producer_id, payload=payload)
+
+    # -- approval transport registration ------------------------------------
+
     def register_approval_transport(self, name: str, present_fn: Callable) -> None:
         """Register a human approval transport, inactive until ``security.approval.transport:
         <name>`` selects it. It receives a redacted ``ApprovalRequest`` and returns only a

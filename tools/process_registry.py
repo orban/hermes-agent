@@ -409,6 +409,11 @@ class ProcessRegistry:
             restore_undelivered_completions(self.completion_queue)
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)
+        try:
+            from tools.background_events import restore_undelivered_events
+            restore_undelivered_events(self.completion_queue)
+        except Exception as exc:
+            logger.warning("Could not restore plugin background events: %s", exc)
         # Completions the agent already consumed via wait()/read_log() (output in
         # hand): drain loops AND gateway/tui watchers skip them.
         self._completion_consumed: set = set()
@@ -1341,7 +1346,7 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
-            is_async_delegation = evt.get("type") == "async_delegation"
+            is_async_delegation = evt.get("type") in {"async_delegation", "background_event"}
             if not self._owns_event(evt, session_key, owns_event, is_async_delegation):
                 requeue.append(evt)
                 continue

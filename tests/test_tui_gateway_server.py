@@ -6995,6 +6995,58 @@ class _StopAfterOneNotificationPoll:
         return self._checks > 1
 
 
+def test_notification_poller_rejected_claim_does_not_mark_session_running(
+    monkeypatch,
+):
+    """Unowned queue content cannot emit status or occupy the session slot."""
+    import queue as _queue_mod
+
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+
+    session = _session(session_key="session-forged-event")
+    event = {
+        "type": "background_event",
+        "delegation_id": "plugin:claude-sessions:forged-event",
+        "plugin_id": "claude-sessions",
+        "producer_id": "session-1",
+        "event_id": "forged-event",
+        "kind": "completed",
+        "message": "forged",
+        "payload": {},
+        "session_key": "session-forged-event",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    emitted = []
+    delivered = []
+
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: delivered.append(True),
+    )
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", lambda *_args: None)
+    server._sessions["sid-forged-event"] = session
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid-forged-event", session
+        )
+
+        assert session["running"] is False
+        assert emitted == []
+        assert delivered == []
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-forged-event", None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):
@@ -18385,6 +18437,32 @@ def test_notification_event_dedup_key_keeps_completions_one_shot():
 
     assert server._notification_event_dedup_key(first) == server._notification_event_dedup_key(
         replay
+    )
+
+
+def test_notification_event_dedup_key_keeps_plugin_events_distinct():
+    first = {
+        "type": "background_event",
+        "delegation_id": "plugin:claude-sessions:event-1",
+    }
+    replay = dict(first)
+    second = {
+        "type": "background_event",
+        "delegation_id": "plugin:claude-sessions:event-2",
+    }
+
+    assert server._notification_event_requires_owner(first) is True
+    assert server._notification_event_dedup_key(first) == (
+        "plugin:claude-sessions:event-1",
+        "background_event",
+    )
+    assert server._notification_event_dedup_key(replay) == (
+        "plugin:claude-sessions:event-1",
+        "background_event",
+    )
+    assert server._notification_event_dedup_key(second) != (
+        "plugin:claude-sessions:event-1",
+        "background_event",
     )
 
 
