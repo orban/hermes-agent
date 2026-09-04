@@ -921,8 +921,17 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
         # Memory: distinguish "store full" from real errors.
         if tool_name == "memory" and failed and "exceed the limit" in data.get("error", ""):
             return True, " [full]"
+        # Structured JSON contracts outrank incidental words in nested payloads.
         err = data.get("error") or data.get("message")
-        if err and (failed or "error" in data):
+        explicit_failure = failed or data.get("ok") is False
+        if explicit_failure:
+            if err:
+                return True, f" [{_trim_error(str(err))}]"
+            return True, " [error]"
+        explicit_success = data.get("success") is True or data.get("ok") is True
+        if explicit_success and not err:
+            return False, ""
+        if err and "error" in data:
             return True, f" [{_trim_error(str(err))}]"
     # Multimodal results (dicts) are successes; failures arrive as JSON-encoded strings.
     if isinstance(result, str) and (

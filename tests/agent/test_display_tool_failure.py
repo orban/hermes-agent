@@ -96,6 +96,19 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_explicit_ok_ignores_nested_failed_state(self):
+        result = json.dumps(
+            {
+                "ok": True,
+                "sessions": [{"id": "deadbeef", "state": "failed"}],
+            }
+        )
+        assert _detect_tool_failure("claude_session_list", result) == (False, "")
+
+    def test_explicit_false_without_error_is_failure(self):
+        result = json.dumps({"ok": False, "data": "unavailable"})
+        assert _detect_tool_failure("example_tool", result) == (True, " [error]")
+
 
 
 class TestGetCuteToolMessageFailureSuffix:
