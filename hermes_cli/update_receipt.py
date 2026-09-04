@@ -203,6 +203,14 @@ def finalize_pending_update_receipt(exit_code: Optional[int] = None, stop_reason
     if exit_code is not None:
         with suppress(Exception):
             _current.data["exit_code"] = int(exit_code)
+    # ``stop_reason`` means "the update stopped abnormally": the fleet-restart-pending check treats any
+    # value as an unfinished update and then reads the PRE-pull ``plan.runtimes`` SHAs, so a normal
+    # completion tagged "completed at command boundary" would keep warning that gateways were never
+    # restarted. Record the boundary note for successes under its own key instead.
+    if outcome == "success" and stop_reason:
+        with suppress(Exception):
+            _current.data["boundary_note"] = stop_reason
+        stop_reason = ""
     return finalize_update_receipt(outcome, stop_reason=stop_reason)
 
 

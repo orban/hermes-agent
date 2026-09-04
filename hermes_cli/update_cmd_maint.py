@@ -37,6 +37,11 @@ _STALE_PURGE_PROTECTED = frozenset(
         "hermes_cli.main",
         "hermes_cli.update_cmd",
         "hermes_cli.hermes_logging",
+        # Holds the open update receipt (``_current``) in module state. Evicting it orphans the
+        # receipt: the command-boundary finalize imports a fresh copy whose slot is empty, no
+        # ``latest.json`` is ever written, and a stale failed receipt keeps reporting "gateways
+        # not restarted" on every later ``hermes gateway status`` / ``hermes update``.
+        "hermes_cli.update_receipt",
     }
     # The updater's own split modules are executing too.
     | {f"hermes_cli.update_cmd_{c}" for c in (

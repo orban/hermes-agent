@@ -82,6 +82,23 @@ def test_purge_protects_executing_modules():
     assert "hermes_cli" in sys.modules
 
 
+def test_purge_keeps_the_open_update_receipt():
+    # The receipt singleton lives in module state; evicting the module orphans an in-flight
+    # receipt so no latest.json is ever written (and a stale failed receipt keeps firing the
+    # "gateways not restarted" warning).
+    from hermes_cli import update_receipt
+
+    update_receipt.begin_update_receipt()
+    try:
+        assert update_receipt._current is not None
+        cli_main._purge_stale_hermes_modules()
+        assert sys.modules.get("hermes_cli.update_receipt") is update_receipt
+        from hermes_cli.update_receipt import _current as still_open
+        assert still_open is update_receipt._current
+    finally:
+        update_receipt._current = None
+
+
 def test_purge_leaves_prefix_lookalikes_alone():
     # `gateway_foo` starts with the string prefix "gateway" but is NOT the
     # gateway package — the root-segment check must spare it.

@@ -181,6 +181,22 @@ class TestCommandBoundaryFinalization:
         assert payload["finished_at"] is not None
         assert ur._current is None
 
+    def test_pending_receipt_on_normal_completion_is_not_marked_stopped(self, receipt_home):
+        # A success finalized at the boundary must not carry ``stop_reason``: the fleet-restart
+        # check reads it as "update did not finish" and falls back to pre-pull plan SHAs, which
+        # re-fires "gateways not restarted" on every later status/update.
+        from hermes_cli import update_cmd_fleet
+
+        ur.begin_update_receipt()
+        path = ur.finalize_pending_update_receipt(0, "completed at command boundary")
+        assert path is not None and path.is_file()
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        assert payload["outcome"] == "success"
+        assert payload["exit_code"] == 0
+        assert "stop_reason" not in payload
+        assert payload["boundary_note"] == "completed at command boundary"
+        assert update_cmd_fleet._receipt_looks_unfinished(payload) is False
+
     def test_pending_receipt_persisted_on_exit_1_failure(self, receipt_home):
         ur.begin_update_receipt()
         path = ur.finalize_pending_update_receipt(1, "sys.exit(1)")
