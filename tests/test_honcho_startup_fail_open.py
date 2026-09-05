@@ -366,6 +366,12 @@ def test_honcho_sync_turn_skips_anchored_gateway_notifications():
         "[Your active task list was preserved across context compression]",
         "[CONTEXT SUMMARY]: previous context",
         "[IMPORTANT: Background process 12 matched watch pattern \"foo\"\nCommand: x",
+        "[IMPORTANT: Background process proc_125d8e6a53d8 completed normally (exit code 0).\n"
+        "Command: /Users/ryo/.hermes/bin/uv sync --locked --all-packages --extra boxlite\nOutput:\n",
+        "[IMPORTANT: Background process proc_9f3a1b2c3d4e failed to start (exit code ?).\nCommand: x",
+        "[IMPORTANT: Background process proc_deadbeef0001 exited (exit code 1).\nCommand: x\nOutput:\n",
+        "[IMPORTANT: Background process proc_deadbeef0002 terminated by Hermes (exit code -15, SIGTERM).\n"
+        "Command: x",
     )
 
     for wrapper in wrappers:
@@ -426,6 +432,8 @@ def test_honcho_sync_turn_does_not_suppress_genuine_user_messages():
         "I want to know about your task list",
         "IMPORTANT: Background process — can you explain what that means?",
         "[IMPORTANT: Background process — what does that mean?]",
+        "Thanks for checking — the background process proc_abc123def456 completed and "
+        "I'm happy with the results.",
     )
 
     for msg in genuine:
