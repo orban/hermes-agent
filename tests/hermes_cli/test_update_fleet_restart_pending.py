@@ -282,6 +282,46 @@ def test_stale_fleet_matrix_on_latest_receipt_is_pending(monkeypatch):
     assert update_cmd._pending_fleet_restart_needed() is True
 
 
+def _write_current_fleet_receipt(code_sha: str) -> None:
+    receipt_dir = get_hermes_home() / "logs" / "update_receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    (receipt_dir / "latest.json").write_text(
+        json.dumps({"outcome": "success", "exit_code": 0,
+                    "fleet": [{"profile": "default", "pid": 9, "code_sha": code_sha, "state": "current"}]}),
+        encoding="utf-8",
+    )
+
+
+def test_receipt_sha_skew_clears_when_live_fleet_is_current(monkeypatch):
+    """A local commit after the update skews the receipt sha; a restarted gateway is not stale."""
+    from hermes_cli import update_receipt
+
+    disk_sha = "n" * 40
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: disk_sha)
+    monkeypatch.setattr(update_cmd_fleet, "_current_checkout_sha", lambda: disk_sha)
+    _write_current_fleet_receipt("o" * 40)
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions",
+                        lambda **k: [{"profile": "default", "pid": 10, "code_sha": disk_sha, "state": "current"}])
+
+    assert update_cmd._pending_fleet_restart_needed() is False
+
+
+def test_receipt_sha_skew_stays_pending_when_live_fleet_is_stale_or_unreachable(monkeypatch):
+    from hermes_cli import update_receipt
+
+    disk_sha = "n" * 40
+    monkeypatch.setattr(update_cmd, "_current_checkout_sha", lambda: disk_sha)
+    monkeypatch.setattr(update_cmd_fleet, "_current_checkout_sha", lambda: disk_sha)
+    _write_current_fleet_receipt("o" * 40)
+
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions",
+                        lambda **k: [{"profile": "default", "pid": 10, "code_sha": "o" * 40, "state": "stale"}])
+    assert update_cmd._pending_fleet_restart_needed() is True
+
+    monkeypatch.setattr(update_receipt, "collect_fleet_versions", lambda **k: [])
+    assert update_cmd._pending_fleet_restart_needed() is True
+
+
 def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **k: []

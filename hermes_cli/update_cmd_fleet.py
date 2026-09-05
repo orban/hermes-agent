@@ -114,11 +114,16 @@ def _receipt_reports_stale_runtime(expected_sha: str | None = None) -> bool:
 
     fleet = receipt.get("fleet")
     if isinstance(fleet, list) and fleet:
-        return any(
+        receipt_stale = any(
             isinstance(entry, dict)
             and (entry.get("state") == "stale" or _sha_mismatch(entry.get("code_sha")))
             for entry in fleet
         )
+        # The receipt is a snapshot from the end of the last update. A gateway restarted since
+        # (``hermes gateway restart``), or a checkout that moved by a local commit and was then
+        # restarted, is current now even though the snapshot's sha no longer matches HEAD. Confirm
+        # against the live fleet before nagging; an empty/unreachable probe keeps the receipt's verdict.
+        return receipt_stale and _live_fleet_confirms_stale()
 
     if not _receipt_looks_unfinished(receipt):
         return False
@@ -129,6 +134,18 @@ def _receipt_reports_stale_runtime(expected_sha: str | None = None) -> bool:
         isinstance(runtime, dict) and _sha_mismatch(runtime.get("code_sha"))
         for runtime in plan.get("runtimes") or []
     )
+
+
+def _live_fleet_confirms_stale() -> bool:
+    """Re-probe running gateways; False only when every reachable one already runs the checkout."""
+    try:
+        from hermes_cli.update_receipt import collect_fleet_versions
+        live = collect_fleet_versions()
+    except Exception:
+        return True
+    if not live:
+        return True
+    return any(not isinstance(row, dict) or row.get("state") != "current" for row in live)
 
 
 def _pending_fleet_restart_needed() -> bool:
