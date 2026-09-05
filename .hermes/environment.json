@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "recipe": {
+    "name": "Hermes Agent dashboard verification",
+    "kind": "mixed",
+    "bootstrap": [
+      "uv sync --locked --python 3.11 --extra all --extra dev",
+      "npm ci"
+    ],
+    "build": [
+      "npm run build --workspace web"
+    ],
+    "test": [
+      "npm run check --workspace web",
+      "scripts/run_tests.sh tests/verify tests/hermes_cli/test_verify_core_dependencies.py tests/hermes_cli/test_verify_console_scripts.py tests/hermes_cli/test_fast_serve_launch.py tests/hermes_cli/test_dashboard_auth_status_endpoint.py tests/hermes_cli/test_dashboard_auth_middleware.py"
+    ],
+    "start": "HERMES_HOME=.hermes/verify-home .venv/bin/hermes serve --host 127.0.0.1 --port 19119 --skip-build",
+    "port": 19119,
+    "readinessPath": "/api/health",
+    "evidence": [
+      "CI-reviewed reproducible Python bootstrap: .github/workflows/e2e-desktop.yml and .github/workflows/tests.yml",
+      "CI-reviewed lockfile-exact JavaScript bootstrap: .github/workflows/e2e-desktop.yml and .github/workflows/js-tests.yml",
+      "Canonical isolated Python test runner and documented path selection: scripts/run_tests.sh",
+      "Verification and dashboard smoke regressions: tests/verify and tests/hermes_cli",
+      "Dashboard package-native check and build scripts: web/package.json#scripts",
+      "Dashboard build workflow: web/README.md#build",
+      "Loopback headless server flags: hermes serve --help",
+      "Public liveness endpoint: hermes_cli/web_routers/status.py#/api/health"
+    ]
+  }
+}
