@@ -210,6 +210,39 @@ def _try_restart_systemd_service(svc_name: str, cgroup_path: str | None = None) 
     return False
 
 
+def _launchd_labels_by_pid() -> dict[int, str]:
+    """``{pid: label}`` for every running job in ``launchctl list`` (macOS only; ``{}`` elsewhere or
+    when launchctl is unavailable). Rows are ``PID<TAB>Status<TAB>Label``; ``-`` marks a loaded job
+    that is not running."""
+    if sys.platform != "darwin":
+        return {}
+    try:
+        result = _run_probe(["launchctl", "list"], timeout=5)
+    except _SYSTEMCTL_ERRORS:
+        return {}
+    if result.returncode != 0:
+        return {}
+    labels: dict[int, str] = {}
+    for line in (result.stdout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0].strip().isdigit() and parts[2].strip():
+            labels[int(parts[0])] = parts[2].strip()
+    return labels
+
+
+def _try_restart_launchd_service(label: str) -> bool:
+    """``launchctl kickstart -k`` *label* (kill + relaunch under launchd, so KeepAlive and the job's
+    own port stay coherent). Tries the ``gui/`` domain, then ``user/``. True on success."""
+    uid = os.getuid()
+    for domain in (f"gui/{uid}", f"user/{uid}"):
+        try:
+            if _run_probe(["launchctl", "kickstart", "-k", f"{domain}/{label}"], timeout=15).returncode == 0:
+                return True
+        except _SYSTEMCTL_ERRORS:
+            continue
+    return False
+
+
 def _dashboard_cmdline_for_pid(pid: int) -> list[str] | None:
     """Exact argv of a running process: ``/proc/<pid>/cmdline`` (Linux), ``ps -o command=`` + shlex
     (macOS), None on Windows (no graceful taskkill window; Desktop manages its backend)."""

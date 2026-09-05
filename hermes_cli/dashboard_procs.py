@@ -342,6 +342,11 @@ def _kill_stale_dashboard_processes(
     pids = _dash._find_stale_dashboard_pids(exclude_pids=exclude or None)
     if not pids:
         return _empty_result()
+    launchd_unrecovered: list[int] = []
+    if restart_managed and sys.platform == "darwin":
+        pids, launchd_unrecovered = _restart_launchd_dashboard_jobs(pids, reason)
+        if not pids:
+            return {**_empty_result(), "unrecovered": launchd_unrecovered}
     # Snapshot systemd unit/cgroup and argv BEFORE killing (the cgroup dies with the process).
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
@@ -378,7 +383,36 @@ def _kill_stale_dashboard_processes(
         if killed:
             print("  Restart the dashboard when you're ready:\n    hermes dashboard --port <port>")
     return {"matched": list(pids), "killed": list(killed), "failed": list(failed),
-            "unrecovered": list(unrecovered)}
+            "unrecovered": list(unrecovered) + launchd_unrecovered}
+
+
+def _restart_launchd_dashboard_jobs(pids: list[int], reason: str) -> tuple[list[int], list[int]]:
+    """macOS: restart launchd-owned dashboard PIDs in place and drop them from the kill list.
+
+    A launchd job with ``KeepAlive`` is the macOS twin of a systemd unit, but it has no cgroup, so the
+    systemd probe classifies it as *manual*: raw-killed, then respawned detached from its argv. launchd
+    respawns its own copy too, which loses the port to our detached one and crash-loops every
+    ``ThrottleInterval`` for good. ``launchctl kickstart -k`` restarts it under launchd instead.
+    Returns ``(remaining_pids, unrecovered_pids)``.
+    """
+    from hermes_cli import main_dashboard as _dash
+    labels = _dash._launchd_labels_by_pid()
+    owned = {pid: labels[pid] for pid in pids if pid in labels}
+    if not owned:
+        return list(pids), []
+    print(f"\n⟲ Restarting {len(owned)} launchd dashboard job(s) ({reason})")
+    unrecovered: list[int] = []
+    seen: set[str] = set()
+    for pid, label in owned.items():
+        if label in seen:
+            continue
+        seen.add(label)
+        if _dash._try_restart_launchd_service(label):
+            print(f"    ✓ restarted launchd job {label}")
+        else:
+            print(f"    ⚠ launchctl kickstart failed for {label}; recover with: launchctl kickstart -k gui/$UID/{label}")
+            unrecovered.append(pid)
+    return [pid for pid in pids if pid not in owned], unrecovered
 
 
 def _restart_killed_backends(
