@@ -441,19 +441,28 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         name-based blocklist can't cover a FIFO (a file TYPE at any path); ``[ -f ]``
         is a stat (symlinks followed) so it answers without touching content."""
         arg = self._escape_shell_arg(path)
+        # A missing path ECHOES its sentinel: a non-zero exit with no sentinel means the shell itself did
+        # not run (container still starting, removed out-of-band, transport down) — not a missing file.
+        # Reporting that as "File not found" made the model trust a false negative for the whole session.
         stat_result = self._exec(
             f"if [ -f {arg} ]; then wc -c < {arg} 2>/dev/null; "
             f"elif [ -e {arg} ]; then echo {NOT_REGULAR_SENTINEL}; "
-            f"else exit 1; fi")
-        if stat_result.exit_code != 0:
-            return 0, "missing"
+            f"else echo {MISSING_SENTINEL}; fi")
         stat_output = _strip_terminal_fence_leaks(stat_result.stdout).strip()
+        if stat_output == MISSING_SENTINEL:
+            return 0, "missing"
         if stat_output == NOT_REGULAR_SENTINEL:
             return 0, "not_regular"
+        if stat_result.exit_code != 0:
+            return 0, "env_unavailable"
         try:
             return int(stat_output), "ok"
         except ValueError:
             return 0, "bad_size"
+
+    def _env_unavailable_error(self, path: str) -> ReadResult:
+        return ReadResult(error=(f"Terminal environment unavailable: could not stat {path} "
+                                 "(the sandbox may still be starting or was removed). Retry shortly."))
 
     def _detect_binary(self, path: str) -> tuple[bool, Optional[bytes]]:
         """``(is_binary, sample_bytes)`` — byte-layer detection when the transport
@@ -812,6 +821,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return self._read_file_missing(path, offset, limit)
         if status == "not_regular":
             return self._not_regular_error(path)
+        if status == "env_unavailable":
+            return self._env_unavailable_error(path)
         if self._is_image(path):  # never inlined — redirect to the vision tool
             return self._image_redirect_result(file_size)
         is_binary, sample_bytes = self._detect_binary(path)
@@ -964,6 +975,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return self._suggest_similar_files(path)
         if status == "not_regular":
             return self._not_regular_error(path)
+        if status == "env_unavailable":
+            return self._env_unavailable_error(path)
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
         is_binary, sample_bytes = self._detect_binary(path)
@@ -985,6 +998,8 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             return ReadResult(error=f"File not found: {path}")
         if status == "not_regular":
             return self._not_regular_error(path)
+        if status == "env_unavailable":
+            return self._env_unavailable_error(path)
         if status == "bad_size":
             return ReadResult(error=f"Could not determine file size: {path}")
         if max_bytes is not None and file_size > max_bytes:

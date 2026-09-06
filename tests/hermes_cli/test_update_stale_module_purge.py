@@ -16,6 +16,8 @@ module graph from the updated checkout.
 
 from __future__ import annotations
 
+import importlib
+import json
 import sys
 import types
 
@@ -82,21 +84,29 @@ def test_purge_protects_executing_modules():
     assert "hermes_cli" in sys.modules
 
 
-def test_purge_keeps_the_open_update_receipt():
-    # The receipt singleton lives in module state; evicting the module orphans an in-flight
-    # receipt so no latest.json is ever written (and a stale failed receipt keeps firing the
-    # "gateways not restarted" warning).
-    from hermes_cli import update_receipt
+def test_purge_preserves_active_update_receipt(tmp_path, monkeypatch):
+    """A receipt begun before the post-pull purge must still be finalizable."""
+    import hermes_cli.update_receipt as receipt
 
-    update_receipt.begin_update_receipt()
+    receipt_dir = tmp_path / "update_receipts"
+    monkeypatch.setattr(receipt, "_receipt_dir", lambda: receipt_dir)
+    receipt._current = None
+    post_purge_receipt = receipt
     try:
-        assert update_receipt._current is not None
+        receipt.begin_update_receipt()
+        receipt.record_step("git_pull", True, "updated checkout")
+
         cli_main._purge_stale_hermes_modules()
-        assert sys.modules.get("hermes_cli.update_receipt") is update_receipt
-        from hermes_cli.update_receipt import _current as still_open
-        assert still_open is update_receipt._current
+        post_purge_receipt = importlib.import_module("hermes_cli.update_receipt")
+        path = post_purge_receipt.finalize_update_receipt("success")
+
+        assert path is not None and path.is_file()
+        latest = json.loads((receipt_dir / "latest.json").read_text(encoding="utf-8"))
+        assert latest["outcome"] == "success"
+        assert latest["steps"][0]["name"] == "git_pull"
     finally:
-        update_receipt._current = None
+        receipt._current = None
+        post_purge_receipt._current = None
 
 
 def test_purge_leaves_prefix_lookalikes_alone():
@@ -151,3 +161,14 @@ def test_stale_symbol_scenario_end_to_end():
         sys.modules.pop(name, None)
         if real is not None:
             sys.modules[name] = real
+
+
+def test_purge_keeps_plan_record_class_identity():
+    # The pre-update plan is built BEFORE the purge; reconciliation after it filters with
+    # ``isinstance(r, RuntimeRecord)``. An evicted ``update_inventory`` yields a fresh class,
+    # every record fails the check, and the plan-vs-execution report goes silently empty.
+    from hermes_cli.update_inventory import RuntimeRecord as before
+
+    cli_main._purge_stale_hermes_modules()
+    from hermes_cli.update_inventory import RuntimeRecord as after
+    assert after is before
