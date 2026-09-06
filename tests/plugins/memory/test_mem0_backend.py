@@ -617,6 +617,49 @@ class TestOSSBackend:
         assert state.clients == []
         assert raw == before
 
+    def test_init_reads_search_threshold_from_oss_config(self, monkeypatch):
+        # mem0's own Memory.search() defaults threshold=0.1 — too permissive to filter
+        # noise (an unrelated query still scores 0.3-0.4 against real facts in practice).
+        _install_fake_mem0(monkeypatch)
+        raw = {
+            "llm": {"provider": "ollama", "config": {"model": "llama3.1:8b"}},
+            "embedder": {"provider": "ollama", "config": {"model": "nomic-embed-text"}},
+            "vector_store": {"provider": "qdrant", "config": {}},
+            "search_threshold": 0.4,
+        }
+
+        backend = OSSBackend(raw)
+
+        assert backend._threshold == 0.4
+
+    def test_init_defaults_search_threshold_to_none_when_unconfigured(self, monkeypatch):
+        _install_fake_mem0(monkeypatch)
+        raw = {
+            "llm": {"provider": "ollama", "config": {"model": "llama3.1:8b"}},
+            "embedder": {"provider": "ollama", "config": {"model": "nomic-embed-text"}},
+            "vector_store": {"provider": "qdrant", "config": {}},
+        }
+
+        backend = OSSBackend(raw)
+
+        assert backend._threshold is None
+
+    def test_search_passes_configured_threshold_to_mem0(self):
+        backend, memory = self._make()
+        backend._threshold = 0.4
+
+        backend.search("query", filters={"user_id": "u1"}, top_k=5)
+
+        assert memory.calls[0] == ("search", "query", {"filters": {"user_id": "u1"}, "top_k": 5, "threshold": 0.4})
+
+    def test_search_omits_threshold_when_unconfigured(self):
+        backend, memory = self._make()
+        backend._threshold = None
+
+        backend.search("query", filters={"user_id": "u1"}, top_k=5)
+
+        assert memory.calls[0] == ("search", "query", {"filters": {"user_id": "u1"}, "top_k": 5})
+
 
 httpx = pytest.importorskip("httpx")
 

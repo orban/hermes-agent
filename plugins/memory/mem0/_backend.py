@@ -119,6 +119,11 @@ class OSSBackend(Mem0Backend):
         from mem0 import Memory
         from ._oss_providers import EMBEDDER_PROVIDERS, KNOWN_DIMS, LLM_PROVIDERS
 
+        # mem0's own Memory.search() defaults threshold=0.1 — far too permissive to filter
+        # irrelevant results (an unrelated control query still scores 0.3-0.4 against real
+        # facts). None preserves mem0's default for configs that don't opt in.
+        self._threshold = oss_config.get("search_threshold")
+
         def _provider_block(name: str, registry: dict) -> dict:
             """Copy of oss_config[name] with the legacy ``api_base`` key mapped to the provider's canonical base-URL key."""
             block = dict(oss_config[name])
@@ -191,7 +196,8 @@ class OSSBackend(Mem0Backend):
                             cur.execute(pgsql.SQL("DROP TABLE IF EXISTS {}").format(pgsql.Identifier(collection_name)))
 
     def search(self, query: str, *, filters: dict, top_k: int = 10, rerank: bool = False) -> list[dict]:
-        return _unwrap_results(self._memory.search(query, filters=filters, top_k=top_k))
+        kwargs = {"threshold": self._threshold} if self._threshold is not None else {}
+        return _unwrap_results(self._memory.search(query, filters=filters, top_k=top_k, **kwargs))
 
     def add(self, messages: list, *, user_id: str, agent_id: str, infer: bool = False, metadata: dict | None = None) -> dict:
         return self._memory.add(messages, **_add_kwargs(user_id, agent_id, infer, metadata))
