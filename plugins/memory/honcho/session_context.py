@@ -11,6 +11,21 @@ logger = logging.getLogger("plugins.memory.honcho.session")
 
 _FAILED = object()  # sentinel: a guarded call raised (distinct from a legitimately empty/None result)
 
+# Honcho's server-side context() splits its result budget across up to three sources
+# (semantic search, "most frequent/derived", and plain recency) whenever a caller leaves
+# search_top_k/max_conclusions/include_most_frequent unset — see
+# src/crud/representation.py::_get_representation_internal on the self-hosted server.
+# Left at their None defaults, a search_query call here gets ~1/3 real search hits, ~1/3
+# "most frequent" conclusions, and ~1/3 pure recency, none of it relevance-gated (the SDK
+# also defaults search_max_distance to None, i.e. no distance filter at all). Pinning
+# search_top_k == max_conclusions and setting include_most_frequent=False drives the
+# recency/frequency slices to zero by arithmetic, matching the fix applied to the Claude
+# Code Honcho plugin's ~/.honcho/config.json on 2026-09-06 (searchMaxDistance below 0.6
+# returned zero matches entirely against this deployment's embedding model/corpus).
+_SEARCH_MAX_CONCLUSIONS = 15
+_SEARCH_TOP_K = _SEARCH_MAX_CONCLUSIONS
+_SEARCH_MAX_DISTANCE = 0.6
+
 
 class SessionContextMixin:
     """Peer context / card / search / conclusion / dialectic operations against Honcho."""
@@ -64,6 +79,10 @@ class SessionContextMixin:
         context_kwargs: dict[str, Any] = self._target_kwargs(target)
         if search_query is not None:
             context_kwargs["search_query"] = search_query
+            context_kwargs["search_top_k"] = _SEARCH_TOP_K
+            context_kwargs["search_max_distance"] = _SEARCH_MAX_DISTANCE
+            context_kwargs["max_conclusions"] = _SEARCH_MAX_CONCLUSIONS
+            context_kwargs["include_most_frequent"] = False
         peer = lambda: self._get_or_create_peer(peer_id)  # noqa: E731
         failed = "Direct %s failed for '%%s': %%s"
         ctx = self._guarded_authed(
@@ -227,6 +246,9 @@ class SessionContextMixin:
 
     def create_conclusion(self, session_key: str, content: str, peer: str = "user") -> bool:
         """Write a conclusion (durable fact) about ``peer`` back to Honcho."""
+        if not bool(getattr(self._config, "explicit_writes", False)):
+            logger.debug("Honcho create_conclusion blocked: explicit writes disabled for this host")
+            return False
         if not content or not content.strip():
             return False
         session = self._cache.get(session_key)
@@ -247,6 +269,9 @@ class SessionContextMixin:
 
     def delete_conclusion(self, session_key: str, conclusion_id: str, peer: str = "user") -> bool:
         """Delete a conclusion by ID. Use only for PII removal."""
+        if not bool(getattr(self._config, "explicit_writes", False)):
+            logger.debug("Honcho delete_conclusion blocked: explicit writes disabled for this host")
+            return False
         def _delete(session: Any) -> bool:
             target_peer_id = self._resolve_peer_id(session, peer)
             self._authed_call(
@@ -273,6 +298,9 @@ class SessionContextMixin:
 
     def set_peer_card(self, session_key: str, card: list[str], peer: str = "user") -> list[str] | None:
         """Replace a peer's card. Returns the updated card, or None on failure."""
+        if not bool(getattr(self._config, "explicit_writes", False)):
+            logger.debug("Honcho set_peer_card blocked: explicit writes disabled for this host")
+            return None
         def _update(session: Any) -> list[str] | None:
             observer_peer_id, target_peer_id = self._resolve_observer_target(session, peer)
             if observer_peer_id is None:
@@ -291,6 +319,9 @@ class SessionContextMixin:
         """Seed the AI peer's representation from text (SOUL.md, exported chats, ...), sent as an
         assistant-peer message so Honcho's reasoning model incorporates it. Unlike the other
         operations, auth failures are logged and swallowed here too."""
+        if not bool(getattr(self._config, "explicit_writes", False)):
+            logger.debug("Honcho seed_ai_identity blocked: explicit writes disabled for this host")
+            return False
         if not content or not content.strip():
             return False
         session = self._cache.get(session_key)

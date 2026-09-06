@@ -60,6 +60,10 @@ def make_manager(monkeypatch):
         runtime_user_peer_name=None,
         **cfg_kwargs,
     ) -> HonchoSessionManager:
+        # explicit_writes defaults True here: this fixture backs migration/write-path
+        # tests, not the explicit_writes gate itself (covered in
+        # test_honcho_startup_fail_open.py) — callers can still override via cfg_kwargs.
+        cfg_kwargs.setdefault("explicit_writes", True)
         cfg = HonchoClientConfig(
             write_frequency=write_frequency,
             api_key="test-key",

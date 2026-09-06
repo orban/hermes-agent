@@ -65,6 +65,9 @@ class TestSanitizeId:
 class TestPeerLookupHelpers:
     def _make_cached_manager(self):
         mgr = HonchoSessionManager()
+        # These tests exercise write helpers directly; explicit_writes gating (added
+        # 2026-09-06) is covered separately in test_honcho_startup_fail_open.py.
+        mgr._config = SimpleNamespace(explicit_writes=True)
         session = HonchoSession(
             key="telegram:123",
             user_peer_id="robert",
@@ -144,6 +147,7 @@ class TestConcludeToolDispatch:
 
     def test_honcho_conclude_defaults_to_user_peer(self):
         provider = HonchoMemoryProvider()
+        provider._config = SimpleNamespace(explicit_writes=True)
         provider._session_initialized = True
         provider._session_key = "telegram:123"
         provider._manager = MagicMock()

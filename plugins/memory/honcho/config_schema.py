@@ -71,6 +71,10 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         # — Message writing —
         _field("saveMessages", "Save messages", KIND_BOOL, "Persist conversation messages to Honcho.",
                default="true", group="Message writing"),
+        _field("explicitWrites", "Explicit profile writes", KIND_BOOL,
+               "Allow direct conclusion, peer-card, identity-seed, and import writes. Automatic message "
+               "projection is controlled separately by saveMessages.",
+               default="false", group="Message writing"),
         _field("writeFrequency", "Write frequency", KIND_TEXT, "When to flush messages: async, turn, session, or every N turns.",
                default="async", info=_WRITE_FREQUENCY_INFO, placeholder="async | turn | session | N", group="Message writing"),
         # — Dialectic —

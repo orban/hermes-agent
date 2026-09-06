@@ -121,8 +121,8 @@ CONCLUDE_SCHEMA = _tool(
     "A deletion ID is an opaque server-generated string: first call with `list=true` "
     "and optionally `query`, then pass the returned ID as `delete_id`. "
     "Deletion exists only for "
-    "PII removal — for merely wrong facts, write a corrected conclusion instead; "
-    "Honcho self-heals contradictions over time. This is a WRITE tool: to read "
+    "PII removal — for merely wrong facts, write a corrected conclusion instead. "
+    "Conflicting conclusions can coexist and remain non-canonical. This is a WRITE tool: to read "
     "the profile use honcho_profile / honcho_context, and to search what was "
     "said use honcho_search.",
     {"conclusion": {"type": "string",

@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+from copy import deepcopy
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.memory_manager import sanitize_context
@@ -55,27 +56,50 @@ def _cfg_usable(cfg) -> bool:
 
 
 # Static per-mode system prompt text (prompt-cache friendly: never changes between turns).
-_TOOL_GUIDE = (
+# Two tool-guide variants, chosen per-instance by explicit_writes (fixed for a session's
+# lifetime, so each is still a static, cacheable string — just one of two, not one of one).
+_TOOL_GUIDE_WRITABLE = (
     "Use honcho_profile for a quick factual snapshot, "
     "honcho_search for raw excerpts, honcho_context for raw peer context, "
     "honcho_reasoning for synthesized answers (pass reasoning_level "
     "minimal/low/medium/high/max — you pick the depth per call), "
     "honcho_conclude to save facts about the user."
 )
-_PROMPT_HEADERS = {
-    "context": (
-        "# Honcho Memory\nActive (context-injection mode). Relevant user context is automatically "
-        "injected before each turn. No memory tools are available — context is managed automatically."
-    ),
-    "tools": (
-        f"# Honcho Memory\nActive (tools-only mode). {_TOOL_GUIDE} "
-        "No automatic context injection — you must use tools to access memory."
-    ),
-    "hybrid": (
-        "# Honcho Memory\nActive (hybrid mode). Relevant context is auto-injected AND memory tools "
-        f"are available. {_TOOL_GUIDE}"
-    ),
-}
+_TOOL_GUIDE_READ_ONLY = (
+    "Use honcho_profile for a quick factual snapshot, "
+    "honcho_search for raw excerpts, honcho_context for raw peer context, "
+    "honcho_reasoning for synthesized answers (pass reasoning_level "
+    "minimal/low/medium/high/max — you pick the depth per call). "
+    "Explicit Honcho conclusion and peer-card mutation is disabled by policy."
+)
+# Honcho is derived, LLM-produced inference — never treat it as ground truth over
+# direct sources (repo/docs/tests) or the operator's own built-in USER/MEMORY facts.
+_AUTHORITY_NOTE = (
+    "Honcho provides derived, fallible context; it is not canonical memory. "
+    "Repository/docs/tests and built-in USER/MEMORY facts take precedence. If Honcho "
+    "sections conflict, surface the inconsistency or abstain; do not invent a reconciliation."
+)
+
+
+def _build_prompt_headers(tool_guide: str) -> Dict[str, str]:
+    return {
+        "context": (
+            f"# Honcho Memory\n{_AUTHORITY_NOTE}\nActive (context-injection mode). Relevant user context is "
+            "automatically injected before each turn. No memory tools are available — context is managed automatically."
+        ),
+        "tools": (
+            f"# Honcho Memory\n{_AUTHORITY_NOTE}\nActive (tools-only mode). {tool_guide} "
+            "No automatic context injection — you must use tools to access memory."
+        ),
+        "hybrid": (
+            f"# Honcho Memory\n{_AUTHORITY_NOTE}\nActive (hybrid mode). Relevant context is auto-injected AND memory tools "
+            f"are available. {tool_guide}"
+        ),
+    }
+
+
+_PROMPT_HEADERS_WRITABLE = _build_prompt_headers(_TOOL_GUIDE_WRITABLE)
+_PROMPT_HEADERS_READ_ONLY = _build_prompt_headers(_TOOL_GUIDE_READ_ONLY)
 
 # (context key, section header) for the injected base-context block, in display order.
 _CONTEXT_SECTIONS = (
@@ -346,6 +370,12 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         """``saveMessages`` is the operator's hard write gate for every Honcho mutation path."""
         return not self._cron_skipped and getattr(self._config, "save_messages", True)
 
+    def _explicit_writes_enabled(self) -> bool:
+        """``explicitWrites`` gates model-invoked mutation (honcho_conclude, honcho_profile
+        card writes) — separate from ``_writes_enabled()``, which only covers automatic/
+        background projection. Missing configuration fails closed (read-only)."""
+        return bool(getattr(self._config, "explicit_writes", False))
+
     def _ready_or_kick_init(self) -> bool:
         """True when writes may proceed; otherwise (outside tools mode) start background init."""
         if self._session_ready():
@@ -365,7 +395,8 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
         Live context (representation, card) is injected via prefetch()."""
         if self._cron_skipped or not (self._config or (self._manager and self._session_key)):
             return ""
-        return _PROMPT_HEADERS.get(self._recall_mode, _PROMPT_HEADERS["hybrid"])
+        headers = _PROMPT_HEADERS_WRITABLE if self._explicit_writes_enabled() else _PROMPT_HEADERS_READ_ONLY
+        return headers.get(self._recall_mode, headers["hybrid"])
 
     def _first_turn_wait(self, base: float) -> float:
         """Turn-1 wait budget: a short request timeout may tighten, but never expand, it."""
@@ -646,10 +677,27 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
     # ----- Tools -----
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Tool schemas by recall_mode; context-only mode exposes no Honcho tools."""
+        """Tool schemas by recall_mode; context-only mode exposes no Honcho tools.
+        When explicit writes are disabled, honcho_conclude is hidden entirely and
+        honcho_profile's card-write parameter is stripped (deepcopy first — never
+        mutate the shared ALL_TOOL_SCHEMAS/CONCLUDE_SCHEMA objects)."""
         if self._cron_skipped or self._recall_mode == "context":
             return []
-        return list(ALL_TOOL_SCHEMAS)
+        if self._explicit_writes_enabled():
+            return list(ALL_TOOL_SCHEMAS)
+        schemas: List[Dict[str, Any]] = []
+        for schema in ALL_TOOL_SCHEMAS:
+            if schema.get("name") == "honcho_conclude":
+                continue
+            schema = deepcopy(schema)
+            if schema.get("name") == "honcho_profile":
+                schema["parameters"]["properties"].pop("card", None)
+                schema["description"] = (
+                    "Read a peer's CARD — a compact, derived list of standing profile facts. "
+                    "This host is read-only; card mutation is disabled."
+                )
+            schemas.append(schema)
+        return schemas
 
     def _empty_profile_hint(self, peer: str) -> Dict[str, Any]:
         """Diagnostic hint for an empty honcho_profile card, so the model can explain WHY
@@ -763,6 +811,16 @@ class HonchoMemoryProvider(DialecticMixin, MemoryProvider):
 
         if self._cron_skipped:
             return tool_error("Honcho is not active (cron context).")
+        # Reject a forged mutation before any lazy session init — the schema hiding in
+        # get_tool_schemas() is advisory (a model could still emit the call), this is the
+        # actual enforcement. Checked first so a disabled host never even opens a session
+        # for a write it's going to refuse anyway.
+        if not self._explicit_writes_enabled():
+            mutates_profile = tool_name == "honcho_conclude" or (
+                tool_name == "honcho_profile" and "card" in args
+            )
+            if mutates_profile:
+                return tool_error("Explicit Honcho writes are disabled by policy for this host.")
         if not self._session_initialized:
             if self._init_thread and self._init_thread.is_alive():
                 return tool_error("Honcho session is still initializing; try again shortly.")

@@ -21,6 +21,9 @@ class SessionMigrationMixin:
     def migrate_memory_files(self, session_key: str, memory_dir: str) -> bool:
         """Upload MEMORY.md / USER.md / SOUL.md to Honcho when it activates on an instance with
         locally consolidated memory; skips missing/empty files. True if at least one uploaded."""
+        if not bool(getattr(self._config, "explicit_writes", False)):
+            logger.debug("Honcho migrate_memory_files blocked: explicit writes disabled for this host")
+            return False
         memory_path = Path(memory_dir)
         if not memory_path.exists():
             return False

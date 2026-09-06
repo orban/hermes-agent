@@ -297,6 +297,9 @@ def _behavior_fields(look: _HostLookup, explicitly_configured: bool) -> dict[str
         "user_peer_aliases": look.string_map("userPeerAliases"),
         "runtime_peer_prefix": look.string("runtimePeerPrefix"),
         "save_messages": look.pick_set("saveMessages", True),
+        # Same migration-guard shape as observation_mode above: hosts configured before
+        # this field existed keep write-capable behavior; fresh installs default read-only.
+        "explicit_writes": look.flag("explicitWrites", default=explicitly_configured),
         "write_frequency": write_frequency,
         "context_tokens": look.parsed("contextTokens", int, None),
         "dialectic_reasoning_level": look.pick("dialecticReasoningLevel") or "low",
@@ -347,6 +350,11 @@ class HonchoClientConfig:
     runtime_peer_prefix: str = ""  # prefix for unknown runtime user ids, e.g. "telegram_"
     # Toggles
     enabled: bool = False
+    # Model-invoked writes (honcho_conclude, honcho_profile card mutation) — separate from
+    # save_messages, which gates automatic/background projection only. Fresh configs default
+    # read-only; hosts already configured before this field existed keep their old
+    # write-capable behavior via the explicitly_configured fallback (see _behavior_fields).
+    explicit_writes: bool = False
     save_messages: bool = True
     write_frequency: str | int = "async"  # "async" | "turn" | "session" | every-N-turns int
     context_tokens: int | None = None  # prefetch budget; None = uncapped

@@ -556,3 +556,156 @@ def test_honcho_on_memory_write_still_writes_when_enabled():
 
     assert write_done.wait(timeout=5), "memory mirror write never completed"
     assert conclusion_calls != []
+
+
+# ---------------------------------------------------------------------------
+# Explicit-writes regression tests (honcho_conclude / honcho_profile card writes)
+#
+# save_messages/_writes_enabled() above gates only automatic/background projection.
+# honcho_conclude and honcho_profile's card mutation are model-invoked and were
+# entirely ungated before explicit_writes existed — these tests cover that gap.
+# ---------------------------------------------------------------------------
+
+
+def test_honcho_conclude_hidden_from_schemas_when_explicit_writes_disabled():
+    """Default (no explicit_writes attribute at all) must hide honcho_conclude and
+    strip honcho_profile's card-write parameter — fail closed on missing config too."""
+    provider = HonchoMemoryProvider()
+    provider._config = _configured_tools_config()
+    provider._recall_mode = "tools"
+
+    schemas = provider.get_tool_schemas()
+    names = [s["name"] for s in schemas]
+
+    assert "honcho_conclude" not in names
+    profile_schema = next(s for s in schemas if s["name"] == "honcho_profile")
+    assert "card" not in profile_schema["parameters"]["properties"]
+
+
+def test_honcho_conclude_present_when_explicit_writes_enabled():
+    """explicit_writes=True restores honcho_conclude and the card-write parameter."""
+    provider = HonchoMemoryProvider()
+    cfg = _configured_tools_config()
+    cfg.explicit_writes = True
+    provider._config = cfg
+    provider._recall_mode = "tools"
+
+    schemas = provider.get_tool_schemas()
+    names = [s["name"] for s in schemas]
+
+    assert "honcho_conclude" in names
+    profile_schema = next(s for s in schemas if s["name"] == "honcho_profile")
+    assert "card" in profile_schema["parameters"]["properties"]
+
+
+def test_honcho_conclude_schema_filtering_does_not_mutate_shared_schema():
+    """Filtering for a read-only host must not corrupt the shared ALL_TOOL_SCHEMAS list
+    a later writable host would read."""
+    read_only = HonchoMemoryProvider()
+    read_only._config = _configured_tools_config()
+    read_only._recall_mode = "tools"
+    read_only.get_tool_schemas()
+
+    writable = HonchoMemoryProvider()
+    cfg = _configured_tools_config()
+    cfg.explicit_writes = True
+    writable._config = cfg
+    writable._recall_mode = "tools"
+    schemas = writable.get_tool_schemas()
+
+    profile_schema = next(s for s in schemas if s["name"] == "honcho_profile")
+    assert "card" in profile_schema["parameters"]["properties"]
+    assert any(s["name"] == "honcho_conclude" for s in schemas)
+
+
+def test_honcho_forged_conclude_call_rejected_before_session_init():
+    """A forged honcho_conclude call on a read-only host must be rejected before any
+    lazy session init is attempted — schema hiding is advisory, this is enforcement."""
+    provider = HonchoMemoryProvider()
+    provider._config = _configured_tools_config()
+    init_calls = []
+
+    def fake_ensure_session():
+        init_calls.append(1)
+        return True
+
+    provider._ensure_session = fake_ensure_session
+
+    result = provider.handle_tool_call("honcho_conclude", {"conclusion": "forged fact"})
+
+    assert "disabled by policy" in result.lower()
+    assert init_calls == []
+
+
+def test_honcho_forged_profile_card_write_rejected_before_session_init():
+    """A forged honcho_profile card write is rejected the same way a conclude call is;
+    a plain read (no card arg) is a different code path and is not covered here."""
+    provider = HonchoMemoryProvider()
+    provider._config = _configured_tools_config()
+    init_calls = []
+
+    def fake_ensure_session():
+        init_calls.append(1)
+        return True
+
+    provider._ensure_session = fake_ensure_session
+
+    result = provider.handle_tool_call("honcho_profile", {"peer": "user", "card": ["forged"]})
+
+    assert "disabled by policy" in result.lower()
+    assert init_calls == []
+
+
+def test_honcho_system_prompt_marks_derived_and_hides_write_guidance():
+    """Read-only hosts see the derived/non-canonical framing and no mention of
+    honcho_conclude; writable hosts keep the original write guidance."""
+    read_only = HonchoMemoryProvider()
+    read_only._config = _configured_tools_config()
+    read_only._recall_mode = "tools"
+    prompt = read_only.system_prompt_block()
+
+    assert "derived, fallible" in prompt.lower()
+    assert "not canonical memory" in prompt.lower()
+    assert "explicit honcho conclusion and peer-card mutation is disabled" in prompt.lower()
+    assert "honcho_conclude" not in prompt
+
+    writable = HonchoMemoryProvider()
+    cfg = _configured_tools_config()
+    cfg.explicit_writes = True
+    writable._config = cfg
+    writable._recall_mode = "tools"
+    writable_prompt = writable.system_prompt_block()
+
+    assert "honcho_conclude" in writable_prompt
+    assert "derived, fallible" in writable_prompt.lower()
+
+
+def test_honcho_low_level_write_guards_cover_all_mutators():
+    """Manager-layer defense in depth: even a caller that bypasses the provider's tool
+    dispatch entirely must still be refused by the mutators themselves."""
+    from plugins.memory.honcho.session import HonchoSessionManager
+
+    stub = SimpleNamespace(_config=_configured_tools_config())
+
+    assert HonchoSessionManager.create_conclusion(stub, "session-key", "a fact") is False
+    assert HonchoSessionManager.delete_conclusion(stub, "session-key", "concl-1") is False
+    assert HonchoSessionManager.set_peer_card(stub, "session-key", ["fact"]) is None
+    assert HonchoSessionManager.seed_ai_identity(stub, "session-key", "identity text") is False
+    assert HonchoSessionManager.migrate_memory_files(stub, "session-key", "/tmp/nonexistent") is False
+
+
+def test_honcho_low_level_write_guards_allow_when_explicit_writes_enabled():
+    """The manager-layer guards must not block writes for a host that explicitly enabled
+    them — this test only proves the guard doesn't short-circuit; it doesn't exercise the
+    full Honcho SDK call path."""
+    from plugins.memory.honcho.session import HonchoSessionManager
+
+    cfg = _configured_tools_config()
+    cfg.explicit_writes = True
+    stub = SimpleNamespace(_config=cfg, _cache={})
+
+    # No cached session for "session-key" -> both return False/None via the existing
+    # "no session cached" path, NOT the explicit-writes guard. Reaching that later
+    # check (instead of an early False from the guard) proves the guard let it through.
+    assert HonchoSessionManager.create_conclusion(stub, "session-key", "a fact") is False
+    assert HonchoSessionManager.seed_ai_identity(stub, "session-key", "identity text") is False
