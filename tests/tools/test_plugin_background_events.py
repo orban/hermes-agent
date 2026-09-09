@@ -247,6 +247,33 @@ def test_unledgered_background_event_cannot_claim_delivery(
     assert isolated_ledger.empty()
 
 
+def test_unadmitted_background_event_refunds_delivery_attempt(
+    isolated_ledger: queue.Queue,
+) -> None:
+    ctx = _context("claude-sessions")
+    ctx.publish_background_event(
+        event_id="deferred-event",
+        kind="completed",
+        message="done",
+        route={"session_key": "session-1"},
+    )
+    event = isolated_ledger.get_nowait()
+
+    claim = async_delegation.claim_event_delivery(event, "gateway")
+    assert claim
+    assert background_events.get_background_event(event["delegation_id"])[
+        "delivery_attempts"
+    ] == 1
+
+    async_delegation.defer_event_delivery(event, claim)
+
+    record = background_events.get_background_event(event["delegation_id"])
+    assert record is not None
+    assert record["delivery_state"] == "pending"
+    assert record["delivery_attempts"] == 0
+    assert async_delegation.claim_event_delivery(event, "gateway-retry")
+
+
 def test_forged_background_event_cannot_reuse_pending_ledger_id(
     isolated_ledger: queue.Queue,
 ) -> None:

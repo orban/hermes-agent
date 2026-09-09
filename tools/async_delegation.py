@@ -422,6 +422,15 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Return an unadmitted completion to pending without spending a delivery attempt."""
+    return _update_delivery("""UPDATE async_delegations SET delivery_claim=NULL,
+                  delivery_claimed_at=NULL, delivery_attempts=MAX(0, delivery_attempts-1),
+                  updated_at=?
+           WHERE delegation_id=? AND delivery_state='pending' AND delivery_claim=?""",
+        (time.time(), delegation_id, claim_id))
+
+
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Terminally drop a claimed completion whose target is permanently gone (the
     spawning session ended at an explicit user boundary such as /new or reset).
@@ -450,6 +459,10 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
 
 def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     _event_delivery(release_completion_delivery, evt, claim_id)
+
+
+def defer_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    _event_delivery(defer_completion_delivery, evt, claim_id)
 
 
 def drop_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

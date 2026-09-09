@@ -487,6 +487,25 @@ def release_event_delivery(event: Dict[str, Any], claim_id: str) -> bool:
         return cursor.rowcount == 1
 
 
+def defer_event_delivery(event: Dict[str, Any], claim_id: str) -> bool:
+    """Return an unadmitted event to pending without spending an attempt."""
+    if not claim_id:
+        return False
+    ledger_id = str(event.get("delegation_id") or "")
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE background_events SET delivery_claim=NULL,
+                      delivery_claimed_at=NULL,
+                      delivery_attempts=MAX(0, delivery_attempts-1),
+                      updated_at=?
+               WHERE ledger_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, ledger_id, claim_id),
+        )
+        return cursor.rowcount == 1
+
+
 def drop_event_delivery(event: Dict[str, Any], claim_id: str) -> bool:
     """Terminally drop an event whose originating session no longer exists."""
     if not claim_id:
