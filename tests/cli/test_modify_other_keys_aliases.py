@@ -264,6 +264,100 @@ def test_modify_other_keys_shift_letter_produces_uppercase(letter):
     )
 
 
+# ---------------------------------------------------------------------------
+# Shift+symbol → the shifted character (modifyOtherKeys form only)
+# ---------------------------------------------------------------------------
+
+# US layout Shift+<key> pairs. The alias is layout-independent — it keys off the
+# codepoint the terminal reports, not the physical key — but these are the ones a
+# Ghostty user actually hits.
+SHIFTED_SYMBOLS = ["!", "@", "#", "$", "%", "^", "&", "*", "(", ")",
+                   "_", "+", "{", "}", "|", ":", '"', "<", ">", "?", "~"]
+
+
+@pytest.mark.parametrize("symbol", SHIFTED_SYMBOLS)
+def test_modify_other_keys_shift_symbol_produces_symbol(symbol):
+    """Shift+<symbol> under modifyOtherKeys must produce the character, not
+    leak as literal escape text.
+
+    Ghostty is pushed onto the modifyOtherKeys-only path, so typing '@'
+    arrives as ESC[27;2;64~ — and 64 already identifies '@' whatever the
+    keyboard layout, because the xterm encoding reports the codepoint the
+    key produced.
+    """
+    seq = f"\x1b[27;2;{ord(symbol)}~"
+    assert _parse(seq) == [symbol], (
+        f"modifyOtherKeys Shift+{symbol} ({seq!r}) should produce '{symbol}'"
+    )
+
+
+@pytest.mark.parametrize("digit", [str(d) for d in range(10)])
+def test_modify_other_keys_shift_digit_stays_unmapped(digit):
+    """A digit codepoint under Shift means the emitter reported the UNSHIFTED
+    key, so the produced character is unknowable — the one answer that is
+    certainly wrong is the digit itself. Leave it unmapped."""
+    assert f"\x1b[27;2;{ord(digit)}~" not in ANSI_SEQUENCES
+
+
+@pytest.mark.parametrize("symbol", SHIFTED_SYMBOLS)
+def test_csi_u_shift_symbol_stays_unmapped(symbol):
+    """The CSI-u twin must NOT be mapped: kitty reports the unshifted
+    codepoint there (Shift+2 -> ESC[50;2u), so the shifted character cannot
+    be derived without knowing the layout."""
+    assert f"\x1b[{ord(symbol)};2u" not in ANSI_SEQUENCES
+
+
+def test_buffer_level_shift_symbol_no_raw_csi():
+    """End-to-end: Shift+2 on a modifyOtherKeys terminal must type '@', not
+    literal ``^[[27;2;64~`` text.
+
+    Same KeyPress.data defect as Shift+letter — ANSI_SEQUENCES maps the
+    sequence, but self-insert pastes event.data (the raw escape bytes) unless
+    the normalization is installed.
+    """
+    import asyncio
+
+    from prompt_toolkit import Application
+    from prompt_toolkit.buffer import Buffer
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.layout import HSplit, Layout, Window, BufferControl
+
+    from hermes_cli.pt_input_extras import install_keypress_data_normalization
+
+    install_keypress_data_normalization()
+
+    async def _probe(payload: str) -> str:
+        buf = Buffer()
+        with create_pipe_input() as inp:
+            app = Application(
+                layout=Layout(HSplit([Window(BufferControl(buf))])), input=inp
+            )
+            run_task = asyncio.ensure_future(app.run_async())
+            await asyncio.sleep(0.05)
+            inp.send_text("ab")
+            inp.send_text(payload)
+            inp.send_text("cd")
+            await asyncio.sleep(0.15)
+            result = buf.text
+            app.exit()
+            try:
+                await asyncio.wait_for(run_task, 2)
+            except Exception:
+                pass
+        return result
+
+    for label, payload, expected in (
+        ("Shift+2 xterm modifyOtherKeys", "\x1b[27;2;64~", "ab@cd"),
+        ("Shift+/ xterm modifyOtherKeys", "\x1b[27;2;63~", "ab?cd"),
+        ("plain symbol", "@", "ab@cd"),
+    ):
+        buffer = asyncio.run(_probe(payload))
+        assert buffer == expected, (
+            f"{label}: buffer={buffer!r} — expected {expected!r}; raw CSI "
+            f"bytes must never land in the buffer"
+        )
+
+
 def test_does_not_clobber_shift_enter_alias():
     """install_modify_other_keys_aliases must not overwrite mappings
     installed by install_shift_enter_alias (modifier=2, not 5)."""

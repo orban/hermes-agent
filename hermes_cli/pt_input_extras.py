@@ -175,7 +175,10 @@ def install_modify_other_keys_aliases() -> int:
     ``_`` `` `` ``@``): same formats → the same ``Keys`` value the raw control byte maps to. *
     **Alt+letter** (a–z, A–Z): ``ESC[27;3;<codepoint>~`` and ``ESC[<codepoint>;3u`` → ``(Keys.Escape,
     <letter>)`` — matching how prompt_toolkit handles a bare ``ESC`` followed by a character. *
-    **Shift+letter** (a–z): → the uppercase character. * **Multi-modifier letters** (Shift+Alt=4,
+    **Shift+letter** (a–z): → the uppercase character. * **Shift+symbol** (``!`` ``@`` ``#`` … — every
+    printable non-alphanumeric): ``ESC[27;2;<codepoint>~`` → that character, since the modifyOtherKeys
+    encoding reports the produced codepoint; the CSI-u twin reports the unshifted key and stays unmapped. *
+    **Multi-modifier letters** (Shift+Alt=4,
     Ctrl+Shift=6, Ctrl+Alt=7, Ctrl+Alt+Shift=8): normalized onto the same targets — Ctrl-bearing combos
     behave as the Ctrl key (Alt adds an ``Escape`` prefix), matching how dte/kakoune normalize these
     protocols. * **Lock-bit variants**: every CSI-u mapping above is also installed with the CapsLock (64)
@@ -240,6 +243,17 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
                 _install_paired(6, {cp: ctrl_key})
                 for modifier in (7, 8):  # Ctrl+Alt and Ctrl+Alt+Shift — same normalization
                     _install_paired(modifier, {cp: (Keys.Escape, ctrl_key)})
+
+    # Shift+<punctuation>, modifyOtherKeys form ONLY. The xterm encoding carries the codepoint the
+    # key PRODUCED, so ESC[27;2;64~ is unambiguously '@' on every layout — the ambiguity that keeps
+    # the CSI-u twin unmapped does not apply here. Kitty reports the UNSHIFTED codepoint instead
+    # (Shift+2 -> ESC[50;2u), which needs the layout to resolve, so that form keeps leaking rather
+    # than inserting a wrong character. Digits are excluded for the same reason: a codepoint of '2'
+    # under Shift means the emitter reported the unshifted key, and '2' is the one certainly wrong
+    # answer. Letters already round-trip through the loop above. Ghostty is the live case — the CLI
+    # pushes modifyOtherKeys=2 for it (and nothing else), so every shifted symbol arrives this way.
+    for codepoint in (cp for cp in range(33, 127) if not chr(cp).isalnum()):
+        _put(f"\x1b[27;2;{codepoint}~", chr(codepoint))
 
     # The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers 1-16 incl. super 9+, and
     # lock twins of the modifier-less form, which is how a lone Esc arrives with a lock on).
