@@ -598,9 +598,13 @@ def _print_update_check_result(behind: int | None, compare_branch: str) -> None:
 def _repair_venv_on_current_checkout(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, desktop_dir,
     had_desktop_app_before_update, active_lazy_features, active_tool_dependencies,
-    _windows_gateway_resume) -> bool:
+    _windows_gateway_resume, completion_message: "str | None" = None) -> bool:
     """Reinstall ``.[all]`` + lazy/tool deps into an unhealthy (or handed-off) venv; returns
-    whether the checkout can be reported complete."""
+    whether the checkout can be reported complete.
+
+    ``completion_message`` overrides the final line for callers whose outcome is not a plain
+    success (the parked-branch skip repairs the install but must not claim the code updated);
+    a message that does not start with ``✓`` reports the run incomplete."""
     # Self-lock deferral: the repair rewrites the venv too (same mapped-extension hazard).
     # See #86735.
     # Self-lock deferral (relocated preflight — #86735): if THIS process holds a native extension the sync
@@ -635,7 +639,7 @@ def _repair_venv_on_current_checkout(
         assume_yes=assume_yes, gateway_mode=gateway_mode, pre_update_snapshot_id=pre_update_snapshot_id)
     # The hand-off child never reaches the commits-pulled rebuild; do it here.
     if _rebuild_desktop_after_update(desktop_dir, had_desktop_app_before_update=had_desktop_app_before_update):
-        return _print_verified_update_completion("✓ Update complete!")
+        return _print_verified_update_completion(completion_message or "✓ Update complete!")
     _print_update_completion(
         "⚠ Update partially complete — the desktop app was not rebuilt and is still on the previous build.")
     return False
@@ -659,9 +663,12 @@ def _pip_install_prefix(uv_bin) -> tuple[list[str], dict | None]:
 def _repair_current_checkout(
     *, assume_yes, gateway_mode, pre_update_snapshot_id, desktop_dir,
     had_desktop_app_before_update, active_lazy_features, active_tool_dependencies,
-    upstream_checked, _windows_gateway_resume) -> bool:
+    upstream_checked, _windows_gateway_resume, completion_message: "str | None" = None) -> bool:
     """Already-up-to-date path: keep the managed runtime current, repair a broken venv.
-    Returns whether the checkout can be reported complete."""
+    Returns whether the checkout can be reported complete.
+
+    ``completion_message`` replaces the "up to date" line on both repair branches when the caller
+    already knows the run is not a success (the parked-branch skip)."""
     # "No new commits" != safe interpreter: uv can keep the same CPython patch while
     # python-build-standalone refreshes the embedded SQLite; keep the boundary hook here too.
     from hermes_cli.managed_uv import ensure_uv, update_managed_uv
@@ -689,12 +696,13 @@ def _repair_current_checkout(
             had_desktop_app_before_update=had_desktop_app_before_update,
             active_lazy_features=active_lazy_features,
             active_tool_dependencies=active_tool_dependencies,
-            _windows_gateway_resume=_windows_gateway_resume)
+            _windows_gateway_resume=_windows_gateway_resume,
+            completion_message=completion_message)
     else:
         current_checkout_complete = _repair_node_deps_on_current_checkout(
             _print_verified_update_completion, assume_yes=assume_yes, gateway_mode=gateway_mode,
             pre_update_snapshot_id=pre_update_snapshot_id,
-            completion_message=(
+            completion_message=completion_message or (
                 "✓ Already up to date!" if upstream_checked
                 else "✓ Up to date with your fork (official repo not checked)."),
             had_desktop_app_before_update=had_desktop_app_before_update)
@@ -838,42 +846,54 @@ class _CheckoutPlan:
     prompt_for_restore: bool
     switch_block_reason: "str | None"
     upstream_checked: bool
+    code_update_skipped: bool = False
 
 
 def _apply_parked_branch_guard(
-    git_cmd, branch, current_branch, *, switch_branch, _windows_gateway_resume
-) -> tuple[bool, bool, "str | None"]:
+    git_cmd, branch, current_branch, *, switch_branch
+) -> tuple[bool, bool, "str | None", bool]:
     """Decide how a checkout parked on another branch is brought to *branch* (stash-switch-pull-
     switch-back used to "update" main while the running code stayed behind).
 
     By branch contents + updates.parked_branch_strategy: fully merged -> switch back;
     unmerged -> "switch" (default; loud "kept" notice) or "update_in_place" (merge origin/<target>
     INTO the branch, checkout never moves; --switch-branch overrides once); dirty/unverifiable ->
-    touch nothing, warn, ``sys.exit(1)`` with the code update SKIPPED (also when the target is
-    missing). Returns ``(parked_branch_switched, in_place_update, switch_block_reason)``.
+    touch nothing and warn, reporting the code update SKIPPED (``sys.exit(1)`` only when the target
+    branch is missing). Returns
+    ``(parked_branch_switched, in_place_update, switch_block_reason, code_update_skipped)``.
+
+    A skip must NOT exit here: everything that keeps this install usable regardless of which commit
+    it sits on — venv repair, dependency sync, and above all the pending fleet-restart catch-up that
+    #91277 requires to always execute — lives downstream. Exiting from the guard skipped all of it,
+    the same "early return strands the fleet" shape the up-to-date path was fixed for.
     """
     if current_branch == branch or current_branch == "HEAD":
-        return False, False, None
+        return False, False, None, False
     switch_safe, switch_block_reason = _m()._assess_parked_branch_switch(
         git_cmd, _m().PROJECT_ROOT, current_branch, branch)
-    if not switch_safe:
-        _m()._print_parked_branch_skip_warning(
-            git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)
-        print()
-        print(f"⚠ Update finished — code update SKIPPED{_branch_head_suffix(git_cmd, _m().PROJECT_ROOT)}")
-        _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
-        sys.exit(1)
-    if not switch_block_reason.startswith("unmerged:"):
-        print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
-        return True, False, switch_block_reason
-    _in_place_configured = False
+    in_place_configured = False
     with _best_effort('Could not read updates.parked_branch_strategy: %s'):
-        _in_place_configured = (
+        in_place_configured = (
             _updates_config().get("parked_branch_strategy", "switch") == "update_in_place")
-    if not _in_place_configured or switch_branch:
+    in_place_wanted = in_place_configured and not switch_branch
+    if not switch_safe:
+        # "dirty" blocks the SWITCH — uncommitted work must not ride an autostash across branches —
+        # but not the in-place merge, which never moves the checkout: the stash is restored onto the
+        # branch it came from, exactly as an ordinary update on the target does. Reading the strategy
+        # only AFTER this check is what made update_in_place unreachable on a dirty tree. "disabled"
+        # and "unverifiable" still block both: the first opts out of branch writes entirely, the
+        # second means the branch state could not be established at all.
+        if not (switch_block_reason == "dirty" and in_place_wanted):
+            _m()._print_parked_branch_skip_warning(
+                git_cmd, _m().PROJECT_ROOT, current_branch, branch, switch_block_reason)
+            return False, False, switch_block_reason, True
+    elif not switch_block_reason.startswith("unmerged:"):
+        print(f"  ⚠ Checkout was parked on '{current_branch}' (fully merged) — switching back to {branch}...")
+        return True, False, switch_block_reason, False
+    elif not in_place_wanted:
         _m()._print_parked_branch_kept_notice(
             current_branch, branch, switch_block_reason.split(":", 1)[1])
-        return True, False, switch_block_reason
+        return True, False, switch_block_reason, False
     # --branch typos used to surface via the checkout failing, which this path skips.
     if _git_run(git_cmd, ["rev-parse", "--verify", "--quiet", f"origin/{branch}"]).returncode != 0:
         print(f"✗ Branch '{branch}' does not exist locally or on origin.")
@@ -881,18 +901,28 @@ def _apply_parked_branch_guard(
     print(
         f"  ℹ On branch '{current_branch}' — updating it in place from "
         f"origin/{branch} (no branch switch; local commits preserved).")
-    return False, True, switch_block_reason
+    return False, True, switch_block_reason, False
 
 
 def _prepare_checkout_for_update(
     git_cmd, branch, current_branch, *, is_fork, assume_yes, gateway_mode, gw_input_fn,
     switch_branch, _windows_gateway_resume):
-    """Parked-branch guard, land on the target, stash, count new commits. Exits when the
-    checkout is unsafe to move or the target is missing. ``commit_count`` is 0 when up to
-    date, -1 when tips differ but the shallow count is unrecoverable."""
-    parked_branch_switched, in_place_update, switch_block_reason = _apply_parked_branch_guard(
-        git_cmd, branch, current_branch, switch_branch=switch_branch,
-        _windows_gateway_resume=_windows_gateway_resume)
+    """Parked-branch guard, land on the target, stash, count new commits. Exits when the target
+    branch is missing. ``commit_count`` is 0 when up to date, -1 when tips differ but the shallow
+    count is unrecoverable.
+
+    A checkout the guard refuses to move returns ``code_update_skipped`` with ``commit_count`` 0
+    and nothing stashed or checked out, so the caller still runs the install repair and the fleet
+    catch-up before reporting the skip."""
+    parked_branch_switched, in_place_update, switch_block_reason, code_update_skipped = (
+        _apply_parked_branch_guard(
+            git_cmd, branch, current_branch, switch_branch=switch_branch))
+    if code_update_skipped:
+        return _CheckoutPlan(
+            auto_stash_ref=None, commit_count=0, in_place_update=False,
+            parked_branch_switched=False, prompt_for_restore=False,
+            switch_block_reason=switch_block_reason, upstream_checked=False,
+            code_update_skipped=True)
 
     if not in_place_update and current_branch == "HEAD" != branch:
         print(f"  ⚠ Currently on detached HEAD — switching to {branch} for update...")
@@ -1176,8 +1206,14 @@ def _finish_already_up_to_date(
     gw_input_fn, pre_update_snapshot_id, desktop_dir, had_desktop_app_before_update: bool,
     active_lazy_features, active_tool_dependencies, _windows_gateway_resume) -> None:
     """"Already up to date" path: restore stash/branch, repair the checkout, catch up the fleet.
-    ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt)."""
+    ``sys.exit(1)`` when the repair is incomplete (after gateway exit code + partial receipt).
+
+    Also the landing point for a parked branch the guard refused to move: the code update is
+    skipped, but the install repair and the pending fleet-restart catch-up still run, and the
+    completion line reports the skip instead of "Already up to date!" — which would be the false
+    success the guard exists to prevent."""
     _invalidate_update_cache()
+    skipped = _plan.code_update_skipped
 
     # Restore stash and switch back if we moved. EXCEPTION: a parked branch verified clean +
     # fully merged stays on the target — re-parking on the stale branch recreates the incident.
@@ -1193,7 +1229,7 @@ def _finish_already_up_to_date(
                 f"{_count} unmerged commit(s) kept on '{current_branch}'.")
         else:
             print(f"  ✓ Checkout was parked on '{current_branch}' (fully merged) — switched back to {branch}.")
-    elif current_branch not in {branch, "HEAD"}:
+    elif not skipped and current_branch not in {branch, "HEAD"}:
         _git_run(git_cmd, ["checkout", current_branch])
 
     current_checkout_complete = _repair_current_checkout(
@@ -1202,7 +1238,8 @@ def _finish_already_up_to_date(
         had_desktop_app_before_update=had_desktop_app_before_update,
         active_lazy_features=active_lazy_features,
         active_tool_dependencies=active_tool_dependencies, upstream_checked=_plan.upstream_checked,
-        _windows_gateway_resume=_windows_gateway_resume)
+        _windows_gateway_resume=_windows_gateway_resume,
+        completion_message="⚠ Update finished — code update SKIPPED" if skipped else None)
     _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
     # A prior pull may still owe the fleet a restart; catch up here too, BEFORE the exit
     # gate so a partial outcome can't strand the fleet on stale code.
@@ -1211,7 +1248,8 @@ def _finish_already_up_to_date(
     # demotes the outcome to partial, but must not strand the fleet on stale code (#91277 fleet contract —
     # the pending-restart check always executes).
     _apply_pending_fleet_restart_catchup()
-    if not current_checkout_complete:
+    # A skipped code update is never a success, whichever repair branch ran above.
+    if not current_checkout_complete or skipped:
         if gateway_mode:
             _write_gateway_update_exit_code(False)
         _finalize_receipt("partial", 'Update receipt finalize (current checkout) failed: %s')
