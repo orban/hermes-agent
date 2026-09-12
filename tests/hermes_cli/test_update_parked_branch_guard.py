@@ -279,9 +279,22 @@ def test_update_skips_and_warns_on_dirty_parked_branch(
 ):
     """Tonight's incident shape: parked branch + dirty tree. The update must
     NOT print '✓ Code updated!', must warn loudly, and must exit non-zero
-    with the branch named in the summary."""
+    with the branch named in the summary.
+
+    The skip covers the CODE only. The install repair and the pending
+    fleet-restart catch-up still have to run: the guard used to ``sys.exit``
+    on the spot, which skipped the whole tail of the update — the same
+    "early return strands the fleet on stale code" shape #91277 fixed on the
+    already-up-to-date path."""
     (repo_pair / "a.txt").write_text("local edit\n")
     _patch_update_flow(monkeypatch, repo_pair)
+    called = []
+    monkeypatch.setattr(
+        update_cmd, "_repair_current_checkout",
+        lambda **kwargs: (called.append(("repair", kwargs["completion_message"])), False)[1])
+    monkeypatch.setattr(
+        update_cmd, "_apply_pending_fleet_restart_catchup",
+        lambda *a, **k: called.append(("fleet_catchup", None)))
     args = SimpleNamespace(branch=None, yes=False, force=False, force_venv=False)
 
     with pytest.raises(SystemExit) as exc_info:
@@ -291,15 +304,99 @@ def test_update_skips_and_warns_on_dirty_parked_branch(
     out = capsys.readouterr().out
     assert "CODE UPDATE SKIPPED" in out
     assert "old-feature" in out
-    assert "code update SKIPPED" in out
     assert "✓ Code updated!" not in out
     assert "✓ Update complete!" not in out
+    # The tail of the update ran despite the skip, and the repair was told to
+    # report the skip rather than "✓ Already up to date!".
+    assert [step for step, _ in called] == ["repair", "fleet_catchup"]
+    assert called[0][1] == "⚠ Update finished — code update SKIPPED"
     # Branch untouched.
     branch = _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     assert branch == "old-feature"
     # No autostash was created — the guard fires before any stash.
     stashes = _git(repo_pair, "stash", "list").stdout.strip()
     assert stashes == ""
+
+
+def test_dirty_tree_still_updates_in_place_when_configured(
+    repo_pair, monkeypatch, capsys
+):
+    """updates.parked_branch_strategy: update_in_place + dirty tree → the
+    update proceeds.
+
+    The dirty check exists to stop uncommitted work riding an autostash
+    ACROSS a branch switch. The in-place merge never moves the checkout, so
+    the stash is restored onto the branch it came from, exactly as an
+    ordinary update on the target does — but the guard read the strategy
+    only after the dirty check, making update_in_place unreachable on any
+    dirty tree."""
+    import hermes_cli.config as hermes_config
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"updates": {"parked_branch_strategy": "update_in_place"}},
+    )
+    (repo_pair / "feature.txt").write_text("unmerged work\n")
+    _git(repo_pair, "add", "feature.txt")
+    _git(repo_pair, "commit", "-qm", "feature work")
+    (repo_pair / "wip.txt").write_text("uncommitted local edit\n")
+    _git(repo_pair, "add", "wip.txt")
+    _patch_update_flow(monkeypatch, repo_pair)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(
+        hermes_main,
+        "_abort_dependency_sync_if_self_locked",
+        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()),
+    )
+    args = SimpleNamespace(branch=None, yes=True, force=False, force_venv=False)
+
+    with pytest.raises(_StopFlow):
+        hermes_main.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "updating it in place" in out
+    assert "CODE UPDATE SKIPPED" not in out
+    # Never moved, and origin/main's code arrived.
+    assert (
+        _git(repo_pair, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        == "old-feature"
+    )
+    assert (repo_pair / "b.txt").exists()
+    # The uncommitted edit came back off the autostash, onto its own branch,
+    # and the stash was consumed rather than left parked.
+    assert (repo_pair / "wip.txt").read_text() == "uncommitted local edit\n"
+    assert _git(repo_pair, "stash", "list").stdout.strip() == ""
+
+
+def test_dirty_tree_skip_writes_gateway_exit_code(
+    repo_pair, monkeypatch, capsys, tmp_path
+):
+    """Gateway mode (`/update` from Telegram or the TUI) polls HERMES_HOME
+    for .update_exit_code and reports a timeout if it never lands. Every
+    other exit path writes it; the parked-branch guard used to exit without
+    one, so a parked + dirty checkout hung the caller until its deadline
+    instead of showing the skip."""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: hermes_home)
+    (repo_pair / "a.txt").write_text("local edit\n")
+    _patch_update_flow(monkeypatch, repo_pair)
+    monkeypatch.setattr(update_cmd, "_repair_current_checkout", lambda **k: False)
+    monkeypatch.setattr(
+        update_cmd, "_apply_pending_fleet_restart_catchup", lambda *a, **k: None)
+    args = SimpleNamespace(
+        branch=None, yes=True, force=False, force_venv=False, gateway=True)
+
+    with pytest.raises(SystemExit) as exc_info:
+        hermes_main.cmd_update(args)
+
+    assert exc_info.value.code == 1
+    assert "CODE UPDATE SKIPPED" in capsys.readouterr().out
+    assert (hermes_home / ".update_exit_code").read_text().strip() == "1"
 
 
 def test_update_switches_unmerged_parked_branch_with_kept_notice(
