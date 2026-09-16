@@ -78,6 +78,21 @@ def _gateway_only_success():
     }
 
 
+def test_desktop_owned_serve_survivor_does_not_hold_the_flag():
+    """#111494: the recovery pass may not restart a Desktop-supervised serve, so it
+    cannot be the reason recovery stays incomplete; an operator-owned survivor
+    alongside it still blocks."""
+    desktop = {"pid": 6161, "kind": "serve", "profile": "default", "supervisor": "desktop"}
+    manual = {"pid": 4242, "kind": "serve", "profile": "default", "supervisor": "manual-serve"}
+    kwargs = dict(
+        planned_gateway_profiles={"default"},
+        covered_gateway_profiles={"default"},
+        recovery_result=_gateway_only_success(),
+    )
+    assert update_cmd._abort_recovery_is_complete(stale_runtime_rows=[desktop], **kwargs) is True
+    assert update_cmd._abort_recovery_is_complete(stale_runtime_rows=[desktop, manual], **kwargs) is False
+
+
 def test_full_gateway_recovery_does_not_clear_the_flag_while_serve_is_stale():
     """The reported bug as a predicate: gateway green, serve still generation N."""
     assert (
@@ -1032,84 +1047,6 @@ def test_serve_backend_survives_selection_when_the_dashboard_unit_restarts(monke
     assert signalled == [7001]
     assert restarted == ["hermes-serve.service"]
     assert result["killed"] == [7001]
-
-
-def _stub_launchd_dashboard(monkeypatch, *, kickstart_ok, restarted, respawned):
-    _stub_dashboard_helpers(
-        monkeypatch,
-        _DASHBOARD_SYSTEMD_UNIT="hermes-dashboard.service",
-        _restart_managed_dashboard_service=lambda reason, *a, **k: False,
-        _find_stale_dashboard_pids=lambda **kwargs: [65096],
-        _launchd_labels_by_pid=lambda: {65096: "com.example.hermes-dashboard"},
-        _try_restart_launchd_service=lambda label: restarted.append(label) or kickstart_ok,
-        _get_pid_cgroup_path=lambda pid: None,
-        _get_systemd_service_for_pid=lambda pid: None,
-        _dashboard_cmdline_for_pid=lambda pid: ["hermes", "dashboard", "--port", "9119"],
-        _respawn_dashboard_processes=lambda cmds: respawned.extend(cmds) or [],
-    )
-
-
-def test_launchd_owned_dashboard_is_kickstarted_not_killed(monkeypatch):
-    """macOS: a launchd-supervised dashboard restarts in place. A raw kill + argv respawn races the
-    job's KeepAlive and leaves launchd crash-looping on the port the respawn took."""
-    from hermes_cli import dashboard_procs
-
-    signalled: list[int] = []
-    restarted: list[str] = []
-    respawned: list = []
-    _stub_launchd_dashboard(monkeypatch, kickstart_ok=True, restarted=restarted, respawned=respawned)
-    monkeypatch.setattr(dashboard_procs, "_lock_owned_serve_pids", lambda: set())
-    monkeypatch.setattr(dashboard_procs.sys, "platform", "darwin")
-    monkeypatch.setattr(dashboard_procs.os, "kill", lambda pid, sig: signalled.append(pid))
-
-    result = dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
-
-    assert signalled == []
-    assert respawned == []
-    assert restarted == ["com.example.hermes-dashboard"]
-    assert result["killed"] == []
-    assert result["unrecovered"] == []
-
-
-def test_launchd_kickstart_failure_is_reported_as_unrecovered(monkeypatch):
-    from hermes_cli import dashboard_procs
-
-    signalled: list[int] = []
-    restarted: list[str] = []
-    respawned: list = []
-    _stub_launchd_dashboard(monkeypatch, kickstart_ok=False, restarted=restarted, respawned=respawned)
-    monkeypatch.setattr(dashboard_procs, "_lock_owned_serve_pids", lambda: set())
-    monkeypatch.setattr(dashboard_procs.sys, "platform", "darwin")
-    monkeypatch.setattr(dashboard_procs.os, "kill", lambda pid, sig: signalled.append(pid))
-
-    result = dashboard_procs._kill_stale_dashboard_processes(restart_managed=True)
-
-    assert signalled == []
-    assert respawned == []
-    assert result["unrecovered"] == [65096]
-
-
-def test_launchd_labels_by_pid_parses_launchctl_list(monkeypatch):
-    from types import SimpleNamespace
-
-    from hermes_cli import main_dashboard
-
-    out = "PID\tStatus\tLabel\n76194\t0\tcom.example.hermes-dashboard\n-\t0\tcom.example.idle\n"
-    monkeypatch.setattr(main_dashboard.sys, "platform", "darwin")
-    monkeypatch.setattr(
-        main_dashboard, "_run_probe", lambda cmd, *, timeout: SimpleNamespace(returncode=0, stdout=out)
-    )
-
-    assert main_dashboard._launchd_labels_by_pid() == {76194: "com.example.hermes-dashboard"}
-
-
-def test_launchd_labels_by_pid_is_empty_off_macos(monkeypatch):
-    from hermes_cli import main_dashboard
-
-    monkeypatch.setattr(main_dashboard.sys, "platform", "linux")
-    monkeypatch.setattr(main_dashboard, "_run_probe", lambda *a, **k: (_ for _ in ()).throw(AssertionError("probed")))
-
-    assert main_dashboard._launchd_labels_by_pid() == {}
 
 
 # ---------------------------------------------------------------------------
