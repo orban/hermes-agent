@@ -2136,7 +2136,8 @@ _FROZEN_UPDATER_SURFACE: dict[str, tuple[str, ...]] = {
         "_resume_windows_gateways_after_update", "_run_logged_subprocess", "_run_pre_update_backup",
         "_stash_local_changes_if_needed", "_stop_process_trees", "_sync_with_upstream_if_needed",
         "_upgrade_pip_before_lazy_refresh", "_venv_launcher_ancestors",
-        "_wait_for_windows_update_gateway_exit", "_warn_orphaned_update_autostashes",
+        "_wait_for_windows_update_gateway_exit", "_warn_autostash_left_parked",
+        "_warn_orphaned_update_autostashes",
         "_write_update_incomplete_marker",
     ),
     "hermes_cli.dashboard_procs": (
