@@ -45,7 +45,10 @@ _PRE_UPDATE_SNAPSHOT_KEEP = 1
 
 # Per-file cap for the quick snapshot (larger files skipped with a warning): it protects
 # small hard-to-regenerate state, not a multi-GB state.db (24 GB cost ~60s + 24 GB/update).
-_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE = 1 << 30  # 1 GiB
+# Raised from 1 GiB locally: this install's state.db passed 1 GiB in August 2026 and was being
+# skipped, which both left it out of every pre-update snapshot and (because a skipped DB blocks
+# the prune, by design, to preserve recovery sources) let state-snapshots/ grow to 52 entries.
+_PRE_UPDATE_SNAPSHOT_MAX_FILE_SIZE = 4 << 30  # 4 GiB
 
 #: Reinstalling through the official installer swaps in a Python whose SQLite is safe; the
 #: one-liner differs per OS (mirrors ``uninstall._REINSTALL_HINT``). windows -> command
