@@ -562,24 +562,29 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     def open_root():
         ctx = client.start_as_current_observation(trace_context=trace_ctx, name="Hermes turn", as_type="chain",
                                                   input=trace_input, metadata=metadata, end_on_exit=False)
-        return ctx, ctx.__enter__()
+        # Attach and detach in one synchronous context. Finalization can run
+        # from another async task/thread, where detaching this contextvars
+        # token would raise ``ValueError: Token was created in a different
+        # Context``. ``end_on_exit=False`` keeps the returned span open.
+        with ctx as span:
+            return span
 
-    root_ctx = root_span = None
+    root_span = None
     if propagate_attributes is not None:
         try:
             with propagate_attributes(session_id=session_id or task_key, trace_name="Hermes turn",
                                       tags=["hermes", "langfuse"]):
-                root_ctx, root_span = open_root()
+                root_span = open_root()
         except Exception:
-            root_ctx = None
-    if root_ctx is None:
-        root_ctx, root_span = open_root()
+            root_span = None
+    if root_span is None:
+        root_span = open_root()
 
     with _failsafe("update_trace(input)"):  # SDK v3 uses update_trace()
         root_span.update_trace(input=trace_input)
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=None, root_span=root_span)
 
 
 def _start_child_observation(state: TraceState, *, name: str, as_type: str, input_value: Any,
@@ -610,14 +615,9 @@ def _end_children(state: TraceState, *, include_subagents: bool = False) -> None
 
 
 def _end_root(state: TraceState, label: str) -> None:
-    """End the root span then unwind its context; never raises."""
+    """End the root span; its current-context attachment ended at creation."""
     with _failsafe(label):
         state.root_span.end()
-        # Unwind the root context manager now, while opentelemetry.trace.Span is
-        # still a real type; GC-driven close at interpreter teardown raises
-        # TypeError inside use_span's isinstance check.
-        if state.root_ctx is not None:
-            state.root_ctx.__exit__(None, None, None)
 
 
 def _finalize_all_traces() -> None:

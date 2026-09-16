@@ -271,3 +271,11 @@ def test_discovery_loaded_setup_module_exposes_post_setup(monkeypatch):
             if k.startswith("plugins.memory.mem0"):
                 del sys.modules[k]
         sys.modules.update(saved)
+        # Loading the replacement package updates ``plugins.memory.mem0`` on
+        # the parent package. Restore that attribute too, not only
+        # ``sys.modules``, or later tests patch one module copy while the
+        # provider imports another.
+        parent = sys.modules.get("plugins.memory")
+        original = saved.get("plugins.memory.mem0")
+        if parent is not None and original is not None:
+            setattr(parent, "mem0", original)

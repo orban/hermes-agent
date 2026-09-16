@@ -141,6 +141,16 @@ def test_run_state_initialization_and_teardown_are_shard_owned():
 
     api_server_runs._close_run_state(adapter)
     store.close.assert_called_once_with()
+    assert getattr(adapter, "_run_idempotency_store") is None
+
+    getattr(adapter, "_run_idempotency_ids").add("run-after-close")
+    api_server_runs._set_run_status(
+        adapter,
+        "run-after-close",
+        "completed",
+        output="late callback",
+    )
+    store.update_status.assert_not_called()
 
 
 def test_run_capability_metadata_is_shard_owned():

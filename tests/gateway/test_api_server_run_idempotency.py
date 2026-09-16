@@ -41,3 +41,11 @@ async def test_disconnect_tolerates_bare_fixture_without_run_idempotency_store()
     adapter._response_store.close.assert_called_once_with()
     adapter._close_cached_session_dbs.assert_called_once_with()
     assert adapter._app is None
+
+
+def test_closed_run_store_ignores_late_status_callback():
+    store = api_server.RunIdempotencyStore(":memory:")
+
+    store.close()
+    store.update_status("late-run", {"status": "completed"})
+    store.close()

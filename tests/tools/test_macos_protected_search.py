@@ -1,6 +1,7 @@
 """macOS TCC-safe behavior for broad file searches."""
 
 import re
+import tempfile
 from pathlib import Path
 
 import tools.file_operations as file_operations
@@ -105,6 +106,53 @@ def test_broad_content_search_passes_protected_globs_to_ripgrep(tmp_path, monkey
     rg_command = next(command for command in env.commands if command.startswith("set -o pipefail; rg"))
     for dirname in PROTECTED_NAMES:
         assert f"!{dirname}/**" in rg_command
+
+
+def test_macos_temp_root_prunes_protected_temporary_items(tmp_path, monkeypatch):
+    temp_root = tmp_path / "var" / "folders" / "T"
+    temp_root.mkdir(parents=True)
+    env = RecordingEnvironment(temp_root)
+    ops = ShellFileOperations(env)
+    monkeypatch.setattr(file_operations.sys, "platform", "darwin")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_root))
+
+    ops.search("*.sh", path=str(temp_root), target="files")
+
+    rg_command = _rg_files_commands(env.commands)[0]
+    assert "!**/TemporaryItems'" in rg_command
+    assert "!**/TemporaryItems/**" in rg_command
+
+
+def test_macos_temp_root_content_search_reports_protected_prune(tmp_path, monkeypatch):
+    temp_root = tmp_path / "var" / "folders" / "T"
+    temp_root.mkdir(parents=True)
+    env = RecordingEnvironment(temp_root)
+    ops = ShellFileOperations(env)
+    monkeypatch.setattr(file_operations.sys, "platform", "darwin")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_root))
+
+    result = ops.search("needle", path=str(temp_root), target="content")
+
+    rg_command = next(command for command in env.commands if command.startswith("set -o pipefail; rg"))
+    assert "!**/TemporaryItems'" in rg_command
+    assert "!**/TemporaryItems/**" in rg_command
+    assert "Skipped macOS service TemporaryItems" in (result.warning or "")
+
+
+def test_explicit_temporary_items_root_is_not_pruned(tmp_path, monkeypatch):
+    temp_root = tmp_path / "var" / "folders" / "T"
+    protected = temp_root / "com.apple.service" / "TemporaryItems"
+    protected.mkdir(parents=True)
+    env = RecordingEnvironment(temp_root)
+    ops = ShellFileOperations(env)
+    monkeypatch.setattr(file_operations.sys, "platform", "darwin")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp_root))
+
+    ops.search("*.sh", path=str(protected), target="files")
+
+    rg_command = _rg_files_commands(env.commands)[0]
+    assert "!**/TemporaryItems'" not in rg_command
+    assert "!**/TemporaryItems/**" not in rg_command
 
 
 def test_empty_ripgrep_file_search_is_one_scan_with_protected_globs(tmp_path, monkeypatch):

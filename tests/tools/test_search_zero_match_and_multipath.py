@@ -22,6 +22,20 @@ def proj(tmp_path, monkeypatch):
 
 
 class TestZeroMatchProbe:
+    def test_dash_prefixed_regex_is_not_parsed_as_ripgrep_flag(self, proj):
+        source = proj / "proj" / "flags.txt"
+        source.write_text("git commit --no-gpg-sign\n")
+
+        result = json.loads(search_tool(
+            "--no-gpg-sign|commit.gpgsign",
+            path=str(proj / "proj"),
+            task_id="t-leading-dash",
+        ))
+
+        assert "error" not in result
+        assert result["total_count"] == 1
+        assert result["matches"][0]["path"] == str(source)
+
     def test_case_mismatch_gets_hint(self, proj):
         r = json.loads(search_tool("token_alpha", path=str(proj / "proj"), task_id="t-zm"))
         assert r["total_count"] == 0

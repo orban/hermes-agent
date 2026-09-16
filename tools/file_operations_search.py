@@ -11,6 +11,7 @@ import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -50,6 +51,29 @@ def _macos_protected_search_exclusions(
         if relative.parts:
             exclusions.append(relative.as_posix())
     return exclusions
+
+
+def _macos_temp_search_requires_prune(
+    path: str, *, cwd: Optional[str] = None, temp_dir: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> bool:
+    """Whether a broad macOS root can descend into protected TemporaryItems.
+
+    Services create TCC-denied ``*/TemporaryItems`` directories below the
+    per-user temp root. Prune them for an ancestor/root search, but keep an
+    explicitly selected descendant available so user intent still wins.
+    """
+    if (platform or sys.platform) != "darwin":
+        return False
+    root = Path(path).expanduser()
+    if not root.is_absolute():
+        root = Path(cwd or os.getcwd()) / root
+    root = Path(os.path.realpath(os.path.normpath(str(root))))
+    temp_root = Path(os.path.realpath(os.path.normpath(temp_dir or tempfile.gettempdir())))
+    try:
+        return root == temp_root or temp_root.is_relative_to(root)
+    except (OSError, ValueError):
+        return False
 
 
 # --- Filename-walk admission: one walk per (backend, root) at a time --------------
@@ -435,6 +459,13 @@ class SearchMixin:
         cwd = getattr(self.env, "cwd", None) or self.cwd
         return _macos_protected_search_exclusions(path, cwd=cwd, home=_fo._HOME, platform=sys.platform)
 
+    def _macos_temp_search_requires_prune(self, path: str) -> bool:
+        env = getattr(self, "env", None)
+        if env is not None and getattr(env, "is_local", True) is False:
+            return False
+        cwd = getattr(env, "cwd", None) or getattr(self, "cwd", os.getcwd())
+        return _macos_temp_search_requires_prune(path, cwd=cwd, platform=sys.platform)
+
     def _protected_prune_paths(self, path: str) -> List[str]:
         """Absolute-ish protected paths for find's ``-path ... -prune``."""
         return [os.path.normpath(os.path.join(path, item)) for item in self._macos_search_exclusions(path)]
@@ -489,6 +520,10 @@ class SearchMixin:
         for item in self._macos_search_exclusions(path):
             for prefix in ("", "**/"):
                 out.extend(["--glob", self._escape_shell_arg(f"!{prefix}{item}/**")])
+        if self._macos_temp_search_requires_prune(path):
+            quote = getattr(self, "_escape_shell_arg")
+            for glob in ("!**/TemporaryItems", "!**/TemporaryItems/**"):
+                out.extend(["--glob", quote(glob)])
         return out
 
     def _path_exists_probe(self, path: str) -> str:
@@ -697,7 +732,7 @@ class SearchMixin:
                 glob_expr_probe = f"{glob_expr} {self._search_prune_glob_args()}"
             else:
                 glob_expr_probe = glob_expr
-            probe_words = [rg, flags, "--count-matches", glob_expr_probe,
+            probe_words = [rg, flags, "--count-matches", glob_expr_probe, "--",
                            self._escape_shell_arg(pattern), self._escape_native_tool_arg(path)]
             probe = self._run_rg_bounded(probe_words, 50, timeout=30)
             total, per_file = 0, []
@@ -864,6 +899,13 @@ class SearchMixin:
                 f"--glob {self._escape_shell_arg(f'!{prefix}{relative}/**')}"
                 for _r, relative, _abs in effective_exclusions
                 for prefix in ("", "**/")]
+        temp_items_pruned = any(self._macos_temp_search_requires_prune(root) for root in roots)
+        if temp_items_pruned:
+            quote = getattr(self, "_escape_shell_arg")
+            exclusion_terms.extend(
+                f"--glob {quote(glob)}"
+                for glob in ("!**/TemporaryItems", "!**/TemporaryItems/**")
+            )
         exclusion_globs = " ".join(dict.fromkeys(exclusion_terms))
         exclusion_args = f" {exclusion_globs}" if exclusion_globs else ""
         rg_executable = rg_executable or self._resolve_command("rg")
@@ -909,14 +951,20 @@ class SearchMixin:
                 error_msg = diagnostics.strip() or result.stdout.strip() or "File search error"
                 return SearchResult(error=f"File search failed: {error_msg}", total_count=0)
             return SearchResult(error="File search failed while running ripgrep.")
+        warning_parts = []
+        if partial_rg_error:
+            warning_parts.append(
+                "File search returned partial results; ripgrep "
+                + (f"reported: {diagnostics.strip()}" if diagnostics.strip()
+                   else f"exited with status {result.exit_code}."))
+        if temp_items_pruned:
+            warning_parts.append(
+                "Skipped macOS service TemporaryItems during broad temp search; "
+                "search one directly when access is intentional.")
         return SearchResult(
             files=all_files[offset:offset + limit], total_count=len(all_files),
             truncated=len(all_files) > offset + limit or bool(limit_reason), limit_reason=limit_reason,
-            warning=(
-                "File search returned partial results; ripgrep "
-                + (f"reported: {diagnostics.strip()}" if diagnostics.strip()
-                   else f"exited with status {result.exit_code}.")
-                if partial_rg_error else None),
+            warning=" ".join(warning_parts) or None,
         )
 
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
@@ -993,14 +1041,23 @@ class SearchMixin:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             cmd_parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.extend(["--", self._escape_shell_arg(pattern)])
         # rg is a native Windows binary (winget/cargo/choco): needs C:/... not MSYS /c/...
         cmd_parts.append(self._escape_native_tool_arg(path))
-        ml_note = (
-            "Pattern contains \\n — multiline mode (-U) was enabled automatically "
-            "so the regex can match across line boundaries."
-        ) if multiline else None
-        return self._run_search_pipeline(cmd_parts, output_mode, limit, offset, context, warning=ml_note)
+        warning_parts = []
+        if multiline:
+            warning_parts.append(
+                "Pattern contains \\n — multiline mode (-U) was enabled automatically "
+                "so the regex can match across line boundaries."
+            )
+        if self._macos_temp_search_requires_prune(path):
+            warning_parts.append(
+                "Skipped macOS service TemporaryItems during broad temp search; "
+                "search one directly when access is intentional.")
+        return self._run_search_pipeline(
+            cmd_parts, output_mode, limit, offset, context,
+            warning=" ".join(warning_parts) or None,
+        )
 
     def _grep_cmd(self, head: List[str], pattern: str, output_mode: str, context: int,
                   file_glob: Optional[str] = None) -> List[str]:
@@ -1012,7 +1069,7 @@ class SearchMixin:
             parts.extend(["--include", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        parts.append(self._escape_shell_arg(pattern))
+        parts.extend(["--", self._escape_shell_arg(pattern)])
         return parts
 
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],

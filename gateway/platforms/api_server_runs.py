@@ -151,9 +151,11 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    store = getattr(self, "_run_idempotency_store", None)
+    self._run_idempotency_store = None
     try:
-        if getattr(self, "_run_idempotency_store", None) is not None:
-            self._run_idempotency_store.close()
+        if store is not None:
+            store.close()
     except Exception:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
 
@@ -174,9 +176,10 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, 
         status != previous_status
         or status in TERMINAL_STATUSES
         or bool(field_names & {"output", "error", "usage", "pending_steer", "session_id"}))
-    if run_id in self._run_idempotency_ids and should_persist:
+    store = getattr(self, "_run_idempotency_store", None)
+    if run_id in self._run_idempotency_ids and should_persist and store is not None:
         try:
-            self._run_idempotency_store.update_status(run_id, current)
+            store.update_status(run_id, current)
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
     return current
