@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+import threading
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -379,18 +380,13 @@ class TestTurnTraceIsolation:
         surviving = sorted(int(k.rsplit("turn", 1)[1]) for k in mod._TRACE_STATE)
         assert surviving == list(range(42, 50))
 
-    def test_finish_trace_exits_root_context_manager(self, monkeypatch):
-        """_finish_trace must call root_ctx.__exit__(), not just root_span.end().
+    def test_root_context_is_exited_before_trace_handoff(self, monkeypatch):
+        """Never retain an attached context for cross-task finalization.
 
-        Regression for the "Exception ignored in: <generator>" traceback
-        on CLI exit.  The plugin enters the root observation's context
-        manager (start_as_current_observation(...).__enter__()) but must
-        also exit it; otherwise the generator is left suspended and is
-        only unwound when the GC collects it during interpreter teardown.
-        By then opentelemetry.trace.Span has been set to None, and the
-        generator's close() -> use_span.__exit__ -> isinstance(span, Span)
-        raises TypeError: isinstance() arg 2 must be a type.  Exiting the
-        context manager here unwinds the generator while modules are intact.
+        ``contextvars`` tokens can only be detached in the context that
+        created them. A gateway callback may finish a turn from a different
+        task or thread, so the root observation context must be unwound while
+        it is opened, while ``end_on_exit=False`` keeps the span alive.
         """
         mod = self._fresh_plugin()
         started: list = []
@@ -398,6 +394,7 @@ class TestTurnTraceIsolation:
         mod._TRACE_STATE.clear()
 
         exited: list = []
+        creator_thread = threading.get_ident()
 
         class _S:
             def update(self, **kw): pass
@@ -409,7 +406,7 @@ class TestTurnTraceIsolation:
             def __enter__(self):
                 return _S()
             def __exit__(self, *exc):
-                exited.append(exc)
+                exited.append((threading.get_ident(), exc))
                 return False
 
         class _TrackingClient:
@@ -423,15 +420,19 @@ class TestTurnTraceIsolation:
 
         monkeypatch.setattr(mod, "_get_langfuse", lambda: _TrackingClient())
 
-        self._run_turn(mod, session="sess-exit", turn_n=1, finalize=True)
+        self._run_turn(mod, session="sess-exit", turn_n=1, finalize=False)
 
-        assert exited, (
-            "_finish_trace did not call root_ctx.__exit__; the generator is "
-            "left suspended and will raise TypeError on GC at interpreter "
-            "teardown when opentelemetry.trace.Span is None"
-        )
-        assert len(exited) == 1
-        assert exited[0] == (None, None, None)
+        assert exited == [(creator_thread, (None, None, None))]
+        state = next(iter(mod._TRACE_STATE.values()))
+        assert state.root_ctx is None
+
+        key = next(iter(mod._TRACE_STATE))
+        worker = threading.Thread(target=mod._finish_trace, args=(key,))
+        worker.start()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert exited == [(creator_thread, (None, None, None))]
 
 
 # ---------------------------------------------------------------------------

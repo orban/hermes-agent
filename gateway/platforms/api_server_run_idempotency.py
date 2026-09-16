@@ -106,6 +106,7 @@ class RunIdempotencyStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS run_idempotency_run_id ON run_idempotency(run_id)")
         self._conn.commit()
         self._lock = threading.Lock()
+        self._closed = False
         self._tighten_permissions()
 
     def _tighten_permissions(self) -> None:
@@ -217,6 +218,8 @@ class RunIdempotencyStore:
 
     def update_status(self, run_id: str, status: Dict[str, Any]) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._conn.execute(
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",
                 (_encode_status(status), time.time(), run_id))
@@ -224,4 +227,7 @@ class RunIdempotencyStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             self._conn.close()
