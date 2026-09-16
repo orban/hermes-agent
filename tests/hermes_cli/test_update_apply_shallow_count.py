@@ -82,7 +82,12 @@ def test_source_matches_exercised_logic():
     """
     import inspect
 
-    src = inspect.getsource(update_cmd._prepare_checkout_for_update)
+    # The block lives in _count_pending_update_commits, which the checkout phase calls
+    # (it was lifted out so an abort mid-count can still settle the autostash).
+    assert "_count_pending_update_commits" in inspect.getsource(
+        update_cmd._prepare_checkout_for_update
+    )
+    src = inspect.getsource(update_cmd._count_pending_update_commits)
     assert "apply_is_shallow" in src
     assert "_github_compare_behind" in src
     # The "count unknown" print stays in _cmd_update_impl, which consumes the plan.

@@ -67,7 +67,7 @@ from hermes_cli.update_cmd_stash import (  # noqa: F401
     _git_untracked_paths, _park_stashed_changes, _print_stash_cleanup_guidance,
     _reject_unsafe_stash_restore, _resolve_stash_selector, _restore_stashed_changes,
     _restored_python_paths, _stash_apply_failed_only_on_existing_untracked,
-    _stash_local_changes_if_needed, _warn_orphaned_update_autostashes)
+    _stash_local_changes_if_needed, _warn_autostash_left_parked, _warn_orphaned_update_autostashes)
 from hermes_cli.update_cmd_config import (  # noqa: F401
     _LAST_SIBLING_SNAPSHOTS, _check_and_apply_config_migration, _migrate_sibling_profile_configs,
     _print_items, _reload_config_modules, _run_config_check_fresh, _run_migrate_config_fresh)
@@ -720,6 +720,21 @@ def _repair_current_checkout(
     return current_checkout_complete
 
 
+class _CleanUpdateAbort(SystemExit):
+    """``sys.exit(1)`` from an abort that left the checkout EXACTLY as the update found it.
+
+    Raised only after the undo itself succeeded (``git merge --abort``, ``git reset --hard
+    <pre_pull_sha>``), so HEAD and the working tree are byte-identical to the moment right
+    after the autostash push. The autostash is then as safe to re-apply as it was before the
+    pull started — see ``_settle_autostash_after_pull``. A SystemExit subclass so every
+    caller, exit code and ``finally`` behaves exactly as with the plain ``sys.exit(1)`` it
+    replaced.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(1)
+
+
 def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
     """Fast-forward failed: merge on a custom branch (local commits survive) or reset --hard on the
     same branch (rescue ref first when histories share no ancestor). ``sys.exit(1)`` on failure."""
@@ -733,11 +748,23 @@ def _reconcile_diverged_checkout(git_cmd, branch: str, pre_pull_sha) -> None:
         # Best-effort safety tag as a recovery anchor.
         _git_run(git_cmd, ["tag", f"pre-update-{_time.strftime('%Y%m%d-%H%M%S')}"])
         if _git_run(git_cmd, ["merge", "--no-edit", f"origin/{branch}"]).returncode != 0:
-            _git_run(git_cmd, ["merge", "--abort"])
+            aborted = _git_run(git_cmd, ["merge", "--abort"])
             print("✗ Merge conflict between local commits and upstream — update stopped, nothing was changed.")
             print(f"  Resolve manually: cd {_m().PROJECT_ROOT} && git merge origin/{branch}")
-            print("  Then re-run the update. Local work is untouched.")
-            sys.exit(1)
+            if aborted.returncode != 0:
+                # The conflicted merge is still in progress: the tree is NOT back to what the
+                # update found, so the caller must not re-apply the autostash onto it.
+                print("  ⚠ `git merge --abort` failed — the conflicted merge is still in progress.")
+                if aborted.stderr.strip():
+                    print(f"    {aborted.stderr.strip().splitlines()[0]}")
+                print(f"    Finish or abort it manually: cd {_m().PROJECT_ROOT} && git merge --abort")
+                sys.exit(1)
+            print("  Then re-run the update.")
+            # merge --abort succeeded: HEAD and the tree are exactly as the update found them, so
+            # the autostash taken before the pull is put back by _settle_autostash_after_pull.
+            # This exit used to shelve uncommitted work in git stash forever: the caller treated
+            # "update failed" as "tree state unknown" and refused every restore.
+            raise _CleanUpdateAbort()
         return
     # Same branch: a true upstream force-push/rebase; local changes are stashed, so reset.
     # Orphan divergence (no common ancestor: corrupted HEAD, re-init) would lose the whole
@@ -790,6 +817,8 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
         if rollback_result.returncode == 0:
             print("  ✓ Rollback complete — your install is unchanged.")
             print("  Try ``hermes update`` again later once a fix lands.")
+            # Back at pre_pull_sha with a clean tree: the autostash goes back too.
+            raise _CleanUpdateAbort()
         else:
             print("  ✗ Rollback failed. Recover manually with:")
             print(f"    cd {_m().PROJECT_ROOT} && git reset --hard {pre_pull_sha}")
@@ -801,6 +830,43 @@ def _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha) -> None:
     sys.exit(1)
 
 
+def _settle_autostash_after_pull(
+    git_cmd, auto_stash_ref, *, update_succeeded, tree_untouched, prompt_for_restore, gw_input_fn,
+    discard_local_changes, keep_stash) -> None:
+    """Decide what happens to the pre-pull autostash once the pull phase is over.
+
+    Three outcomes, in priority order:
+
+    * the update aborted and the checkout is NOT provably back to what it was -> keep the
+      entry and say so loudly (the tree could be mid-merge; applying onto it may conflict);
+    * the update aborted but the abort undid itself cleanly (``tree_untouched``) -> restore,
+      exactly like the "Already up to date" path does. Neither ``--keep-stash`` nor
+      ``updates.non_interactive_local_changes: discard`` applies here: both are premised on
+      new code having landed, and nothing landed;
+    * the update landed -> discard / park / restore per flags and config, as before.
+    """
+    if auto_stash_ref is None:
+        return
+    if not update_succeeded:
+        if not tree_untouched:
+            _m()._warn_autostash_left_parked(auto_stash_ref)
+            return
+        _m()._restore_stashed_changes(
+            git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=prompt_for_restore,
+            input_fn=gw_input_fn)
+        return
+    if discard_local_changes:
+        # Non-interactive + updates.non_interactive_local_changes: discard.
+        _m()._discard_stashed_changes(git_cmd, _m().PROJECT_ROOT, auto_stash_ref)
+    elif keep_stash:
+        # --keep-stash (desktop updater): leave edits parked rather than re-apply silently.
+        _m()._park_stashed_changes(auto_stash_ref)
+    else:
+        _m()._restore_stashed_changes(
+            git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=prompt_for_restore,
+            input_fn=gw_input_fn)
+
+
 def _pull_updates(
     git_cmd, branch, auto_stash_ref, *, prompt_for_restore, gw_input_fn, discard_local_changes,
     keep_stash):
@@ -808,6 +874,7 @@ def _pull_updates(
     custom branch -> merge, same branch -> reset, orphan history -> rescue ref first; a
     post-pull syntax error in a critical file rolls back. Exits on failure; returns pre-pull SHA."""
     update_succeeded = False
+    tree_untouched = False
     # Pre-pull SHA for auto-rollback (stray conflict markers once bricked every updater).
     # Capture the pre-pull SHA so we can auto-roll-back if the new code has a syntax error in a
     # critical-path file (PR #28452 incident: orphan merge-conflict markers in hermes_cli/config.py bricked
@@ -820,22 +887,17 @@ def _pull_updates(
             _reconcile_diverged_checkout(git_cmd, branch, pre_pull_sha)
         _rollback_if_pulled_syntax_error(git_cmd, pre_pull_sha)
         update_succeeded = True
+    except _CleanUpdateAbort:
+        # The abort undid itself (merge --abort / reset --hard pre_pull_sha): the checkout is
+        # byte-identical to what the update found, so the autostash can go back.
+        tree_untouched = True
+        raise
     finally:
-        if auto_stash_ref is not None:
-            # No stash restore if the update failed — tree state is unknown.
-            if not update_succeeded:
-                print(f"  ℹ️  Local changes preserved in stash (ref: {auto_stash_ref})")
-                print("  Restore manually with: git stash apply")
-            elif discard_local_changes:
-                # Non-interactive + updates.non_interactive_local_changes: discard.
-                _m()._discard_stashed_changes(git_cmd, _m().PROJECT_ROOT, auto_stash_ref)
-            elif keep_stash:
-                # --keep-stash (desktop updater): leave edits parked rather than re-apply silently.
-                _m()._park_stashed_changes(auto_stash_ref)
-            else:
-                _m()._restore_stashed_changes(
-                    git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn)
+        _settle_autostash_after_pull(
+            git_cmd, auto_stash_ref, update_succeeded=update_succeeded,
+            tree_untouched=tree_untouched, prompt_for_restore=prompt_for_restore,
+            gw_input_fn=gw_input_fn, discard_local_changes=discard_local_changes,
+            keep_stash=keep_stash)
     return pre_pull_sha
 
 
@@ -950,6 +1012,38 @@ def _prepare_checkout_for_update(
         and not assume_yes
         and (gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())))
 
+    try:
+        commit_count, upstream_checked = _count_pending_update_commits(
+            git_cmd, branch, is_fork=is_fork, assume_yes=assume_yes, gw_input_fn=gw_input_fn)
+    except (Exception, SystemExit):
+        # Everything the count needs is read-only, but it can still fail hard (`rev-list` runs
+        # under check=True; the upstream sync can exit). Those unwinds used to sail straight past
+        # the autostash — the run ended without ever naming it again. Nothing here has written to
+        # the tree beyond an already-successful `git checkout`, so putting the changes back is as
+        # safe as on the "Already up to date" path.
+        if auto_stash_ref is not None:
+            _m()._restore_stashed_changes(
+                git_cmd, _m().PROJECT_ROOT, auto_stash_ref, prompt_user=False, input_fn=gw_input_fn)
+        raise
+    except BaseException:
+        # Ctrl-C: don't start a multi-step restore the user is actively interrupting — just make
+        # sure the parked work is impossible to miss.
+        if auto_stash_ref is not None:
+            _m()._warn_autostash_left_parked(auto_stash_ref)
+        raise
+
+    return _CheckoutPlan(
+        auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
+        parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
+        switch_block_reason=switch_block_reason, upstream_checked=upstream_checked)
+
+
+def _count_pending_update_commits(
+    git_cmd, branch, *, is_fork: bool, assume_yes: bool, gw_input_fn) -> tuple[int, bool]:
+    """``(commit_count, upstream_checked)`` for the fetched ``origin/<branch>``.
+
+    ``commit_count`` is 0 when up to date, -1 when the tips differ but a shallow checkout
+    makes the exact number unrecoverable. Read-only apart from the fork upstream sync."""
     # On shallow checkouts `rev-list --count` can report the entire remote ancestry. The
     # zero/nonzero gate is still sound; treat the shallow NUMBER as unknown and recover it
     # via the GitHub compare API when possible.
@@ -983,11 +1077,7 @@ def _prepare_checkout_for_update(
                 git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
             # HEAD moving is proof of an update even if the count can't be read.
             commit_count = max(1, synced_count)
-
-    return _CheckoutPlan(
-        auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
-        parked_branch_switched=parked_branch_switched, prompt_for_restore=prompt_for_restore,
-        switch_block_reason=switch_block_reason, upstream_checked=upstream_checked)
+    return commit_count, upstream_checked
 
 
 @dataclass

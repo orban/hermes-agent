@@ -177,6 +177,22 @@ def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
     return saw_untracked_error
 
 
+def _warn_autostash_left_parked(stash_ref: str) -> None:
+    """Loud notice for an autostash the updater could NOT put back.
+
+    Only for aborts that left the checkout in an unknown state (a failed ``merge --abort``,
+    a failed rollback ``reset``): re-applying onto an unknown tree could conflict or mask a
+    half-finished merge, so the entry stays parked. Never silent — the ref and the exact
+    recovery command are printed, because nothing re-surfaces a stash afterwards except the
+    7-day orphan warning (see ``_warn_orphaned_update_autostashes``).
+    """
+    print()
+    print(f"  ℹ️  Local changes preserved in stash (ref: {stash_ref})")
+    print("     They were NOT re-applied: the working tree is not in a known-good state.")
+    print(f"     Restore manually with: git stash apply {stash_ref}")
+    print("     Nothing is lost — the entry stays in `git stash` until you apply or drop it.")
+
+
 def _park_stashed_changes(stash_ref: str) -> None:
     """Leave a pre-update autostash parked (``--keep-stash``, the desktop updater's mode): local source
     edits must never be silently re-applied onto updated code; the entry stays in ``git stash``."""
