@@ -175,10 +175,9 @@ def install_modify_other_keys_aliases() -> int:
     ``_`` `` `` ``@``): same formats → the same ``Keys`` value the raw control byte maps to. *
     **Alt+letter** (a–z, A–Z): ``ESC[27;3;<codepoint>~`` and ``ESC[<codepoint>;3u`` → ``(Keys.Escape,
     <letter>)`` — matching how prompt_toolkit handles a bare ``ESC`` followed by a character. *
-    **Shift+letter** (a–z): → the uppercase character. * **Shift+symbol** (``!`` ``@`` ``#`` … — every
-    printable non-alphanumeric): ``ESC[27;2;<codepoint>~`` → that character, since the modifyOtherKeys
-    encoding reports the produced codepoint; the CSI-u twin reports the unshifted key and stays unmapped. *
-    **Multi-modifier letters** (Shift+Alt=4,
+    **Shift+letter** (a–z): → the uppercase character. * **Shift+symbol** (tilde form only): ``ESC[27;2;<cp>~``
+    → ``chr(cp)`` for printable ASCII — xterm and Ghostty put the produced character in that codepoint (#114242).
+    * **Multi-modifier letters** (Shift+Alt=4,
     Ctrl+Shift=6, Ctrl+Alt=7, Ctrl+Alt+Shift=8): normalized onto the same targets — Ctrl-bearing combos
     behave as the Ctrl key (Alt adds an ``Escape`` prefix), matching how dte/kakoune normalize these
     protocols. * **Lock-bit variants**: every CSI-u mapping above is also installed with the CapsLock (64)
@@ -228,9 +227,10 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
     _install_paired(5, ctrl_key_map)
 
     # Letter combos. Alt+a -> (Escape, 'a') like bare Alt. Shift+a -> 'A' (safe on every Latin
-    # layout; Shift+digit symbols are layout-specific and deliberately NOT mapped — leaking beats
-    # wrong input). Kitty reports the UNSHIFTED codepoint, some modifyOtherKeys emitters the shifted
-    # one — map both. Ctrl-bearing combos normalize onto the Ctrl key (Alt adds an Escape prefix),
+    # layout). Kitty CSI-u reports the UNSHIFTED codepoint, modifyOtherKeys emitters the shifted
+    # one — map both. Shift+symbol is mapped only in the tilde form below: the CSI-u codepoint is
+    # unshifted (ESC[47;2u is Shift+/ on US, '?' — layout-specific), so there leaking beats wrong
+    # input. Ctrl-bearing combos normalize onto the Ctrl key (Alt adds an Escape prefix),
     # Shift+Alt onto (Escape, UPPER) — the same normalization dte/kakoune apply.
     for ch in letters:
         upper_char = chr(ch - 32)
@@ -244,16 +244,20 @@ def _modify_other_keys_aliases(ANSI_SEQUENCES: dict, Keys) -> dict[str, object]:
                 for modifier in (7, 8):  # Ctrl+Alt and Ctrl+Alt+Shift — same normalization
                     _install_paired(modifier, {cp: (Keys.Escape, ctrl_key)})
 
-    # Shift+<punctuation>, modifyOtherKeys form ONLY. The xterm encoding carries the codepoint the
-    # key PRODUCED, so ESC[27;2;64~ is unambiguously '@' on every layout — the ambiguity that keeps
-    # the CSI-u twin unmapped does not apply here. Kitty reports the UNSHIFTED codepoint instead
-    # (Shift+2 -> ESC[50;2u), which needs the layout to resolve, so that form keeps leaking rather
-    # than inserting a wrong character. Digits are excluded for the same reason: a codepoint of '2'
-    # under Shift means the emitter reported the unshifted key, and '2' is the one certainly wrong
-    # answer. Letters already round-trip through the loop above. Ghostty is the live case — the CLI
-    # pushes modifyOtherKeys=2 for it (and nothing else), so every shifted symbol arrives this way.
-    for codepoint in (cp for cp in range(33, 127) if not chr(cp).isalnum()):
-        _put(f"\x1b[27;2;{codepoint}~", chr(codepoint))
+    # Shift+printable ASCII under modifyOtherKeys (tilde form only, never CSI-u): xterm's own key
+    # table sends Shift+[ as ESC[27;2;123~ — the codepoint is the PRODUCED character '{', already
+    # resolved through the user's keymap — and Ghostty follows that spec (#114242, #102683). So
+    # ESC[27;2;<cp>~ -> chr(cp) is layout-safe on every tilde-form emitter; the
+    # unshifted-codepoint concern belongs to Kitty CSI-u, which never uses this spelling.
+    # Existing entries (Shift+Enter \x1b[27;2;13~, Shift+Tab, Shift+Space) win via setdefault.
+    # xterm/Ghostty only use this encoding for produced codepoints 0x40-0x7E (`IsControlInput`);
+    # '!' '#' '$' still arrive as plain text, so the 33-63 rows are inert there but harmless.
+    # Super+<printable> (modifier 9, Super+Shift 10) follows the same produced-codepoint rule:
+    # Ghostty sends Super+o as ESC[27;9;111~ (#114242). The CLI has no Super bindings, so type
+    # the character — what the terminal sends without modifyOtherKeys and what the Ink TUI does.
+    for cp in range(33, 127):
+        for modifier in (2, 9, 10):
+            _put(f"\x1b[27;{modifier};{cp}~", chr(cp))
 
     # The Esc KEY under Kitty disambiguate mode: ESC[27u (+ modifiers 1-16 incl. super 9+, and
     # lock twins of the modifier-less form, which is how a lone Esc arrives with a lock on).
