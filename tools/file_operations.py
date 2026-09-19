@@ -1433,7 +1433,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             if multi is not None:
                 return multi
             return self._path_not_found_result(path)
-        if "symlink" in path_status:
+        if "symlink" in exists_probe:
             target_status = self._symlink_target_status(path)
             if target_status == "dangling":
                 return SearchResult(error=(
